@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wontopos"
+version = "2.2.37"
+description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."
+readme = "README.md"
+authors = [{ name = "Wontopos" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["memory", "ai", "agent", "llm", "multilingual", "rag", "context"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# >=2.32: includes the cert-verification fix (CVE-2024-35195); keep the floor current.
+dependencies = ["requests>=2.32"]
+
+[project.optional-dependencies]
+async = ["httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://wontopos.com"
+Source = "https://github.com/wontopos/wontopos-python"
+Documentation = "https://wontopos.com/en/why"
+Issues = "https://wontopos.com/contact?topic=bug"
+"Report a security issue" = "https://wontopos.com/contact?topic=security"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["wontopos*"]
+
+# Ship the PEP 561 marker so type checkers (mypy / Pyright) and IDEs read the
+# inline type hints from an installed `wontopos`.
+[tool.setuptools.package-data]
+wontopos = ["py.typed"]
