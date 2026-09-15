@@ -194,7 +194,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive: nothing is removed or reordered within a minor line, and a
-release that bends that says so at the top of its own entry.
+releases are additive. Four inside 2.2 were not, deliberately and each with its
+reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

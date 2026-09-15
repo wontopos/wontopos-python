@@ -51,6 +51,7 @@ masked in ``repr``. Prefer ``Client.from_env()`` over keys in source code.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -67,7 +68,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-__version__ = "2.2.37"
+__version__ = "2.2.38"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -159,6 +160,33 @@ _WARNED_STORE_IDS_MAX = 1024
 #: One lock for both process-global warn caches — see _warn_if_store_id_collapses.
 _warn_lock = threading.Lock()
 _warned_store_ids: "dict" = {}
+
+
+class _Backoff(Exception):
+    """Internal: leave an open streaming response before sleeping on a retry.
+
+    Not an error anyone sees. The async client used to `await asyncio.sleep(...)` inside
+    `async with client.stream(...)`, which holds a pooled connection for the whole
+    backoff; a 429 burst then parked the entire httpx pool and every other request in
+    the process failed PoolTimeout.
+    """
+
+
+def _assert_usable_store_id(user_id: Any) -> None:
+    """A store id is usable when it is a non-blank string. Anything else is a bug at the
+    call site, not a value to fall back from.
+
+    Not just blank: any value that is not a usable store id. An integer primary key is
+    the common one. ``user_id=0`` is falsy, so without this check it reaches the default
+    store, and any other int reaches the warning helper and dies there with "'int' object
+    has no attribute 'lower'". Neither says what was wrong, and one of them wrote a
+    customer's memories somewhere else.
+    """
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError(
+            f"user_id must be a non-blank string; got {user_id!r}. Omit it to use the client's default "
+            "store, or pass a real store id — anything else would silently write into the default store."
+        )
 
 
 def _warn_if_store_id_collapses(sid: str) -> None:
@@ -313,6 +341,57 @@ def _recall_body(store_id: str, query: str, form: Optional[str], tz: Optional[in
     return body
 
 
+_KNOWN_SEARCH_KEYS = frozenset(
+    {"cache_control", "speaker", "filters", "verify", "max_images", "extra"}
+)
+# Named arguments of the call. Reaching the body through ``opts`` would let forwarded
+# input choose someone else's store.
+_RESERVED_SEARCH_KEYS = frozenset({"user_id", "query", "max_results"})
+
+
+def _edit_within(a: str, b: str, max_edits: int) -> bool:
+    """Within ``max_edits`` single-character edits. Short keys, one bad key at a time."""
+    if abs(len(a) - len(b)) > max_edits:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[len(b)] <= max_edits
+
+
+def _check_search_opts(opts: dict) -> None:
+    """Refuse a search option this client does not know.
+
+    The service drops keys it does not recognise and answers normally, so a misspelled
+    option cannot be told from one that worked: ``verify`` buys extra retrieval passes
+    and ``verfy`` buys nothing while the reply still looks complete. Filters only warn,
+    because a wrong filter still returns memories; a wrong option turns a paid feature
+    off in silence. ``extra`` carries anything this version has not learned yet.
+    """
+    for k in opts:
+        if k in _RESERVED_SEARCH_KEYS:
+            raise ValueError(
+                f"{k!r} is set by the call, not by options — pass it as an argument. "
+                "An app forwarding untrusted input as options cannot steer the store, "
+                "the query or the count, and this says so rather than dropping it silently."
+            )
+        if k in _KNOWN_SEARCH_KEYS:
+            continue
+        near = next(
+            (n for n in sorted(_KNOWN_SEARCH_KEYS) if n != "extra" and _edit_within(k, n, 2)), None
+        )
+        raise ValueError(
+            f"unknown search option {k!r}"
+            + (f" — did you mean {near!r}?" if near else "")
+            + ". The service drops keys it does not know and answers anyway, so this "
+            "would have looked like it worked. Pass it under 'extra' if the service "
+            "accepts it and this client does not know it yet."
+        )
+
+
 def _search_body(store_id: str, query: str, limit: int, opts: dict,
                  verify: Optional[int] = None, max_images: Optional[int] = None) -> dict:
     """The /memory/search request body, built one way for all four search methods.
@@ -326,9 +405,12 @@ def _search_body(store_id: str, query: str, limit: int, opts: dict,
     ``max_images`` are set last for the same reason — a stray copy inside ``opts``
     cannot beat the named argument the caller actually wrote.
     """
+    _check_search_opts(opts)
     _warn_on_unknown_filters(opts.get("filters"))
     _check_count(limit)
-    body = {**opts, "user_id": store_id, "query": query, "max_results": limit}
+    extra = opts.get("extra") or {}
+    known = {k: v for k, v in opts.items() if k != "extra"}
+    body = {**extra, **known, "user_id": store_id, "query": query, "max_results": limit}
     if verify is not None:
         body["verify"] = verify
     if max_images is not None:
@@ -415,6 +497,18 @@ def _clean_key(api_key: str) -> str:
     # one value that actually becomes a header.
     if _HEADER_CTL_RE.search(key):
         raise ValueError("api_key contains a control character - check for a paste error")
+    # Keys are ASCII by construction, and a header value is latin-1 on the wire. A key
+    # pasted from a rich-text doc, Slack or a PDF has had its hyphen turned into an en
+    # dash, and that used to travel all the way into http.client and die there as
+    # UnicodeEncodeError — not a WosError, so `except WosError` around the call missed
+    # it, and the message never said "api_key". The test is ASCII rather than latin-1:
+    # 'é' encodes as latin-1 and so would have sailed through to a mystery 401.
+    if not key.isascii():
+        bad = next(c for c in key if not c.isascii())
+        raise ValueError(
+            f"api_key contains a non-ASCII character ({bad!r}) - rich text turns '-' into an en dash; "
+            "copy the key from a plain-text field"
+        )
     return key
 
 
@@ -891,7 +985,13 @@ class Client:
         self._model = _check_model(model)
         # The store every call uses unless one passes user_id=. "default" is the
         # account's built-in store, so the zero-config path needs no create call.
-        self._user_id = user_id or self.DEFAULT_USER
+        # The same guard _uid applies per call. It used to live only there, so the
+        # constructor and with_user() — the documented per-tenant pattern — walked past
+        # it: user_id=0 and user_id="" became the shared `default` store with no warning,
+        # while add(text, user_id=0) raised. A destination that depends on WHICH door the
+        # id came through is the worst kind of silent redirect.
+        _assert_usable_store_id(user_id)
+        self._user_id = user_id
         self._retries = max(0, int(retries))
         self._rate_limit: Optional[dict] = None
         # A clone (with_model/with_user/with_timeout/with_retries) SHARES the
@@ -967,7 +1067,7 @@ class Client:
     def with_model(self, model: str) -> "Client":
         """A client that uses ``model`` for every call (everything else kept).
         Shares this client's connection pool, so a per-call override
-        (``mem.with_model("scroll-1").recall(...)``) reuses the open connection.
+        (``mem.with_model("scroll-1.2").recall(...)``) reuses the open connection.
         """
         return self._clone(model=model)
 
@@ -1016,16 +1116,8 @@ class Client:
         # that was PASSED but is blank is a different thing: the caller computed a tenant
         # id and got nothing, and falling back writes that customer's memories into
         # whatever store this client defaults to, silently.
-        if user_id is not None and (not isinstance(user_id, str) or not user_id.strip()):
-            # Not just blank: any PASSED value that is not a usable store id. An integer
-            # primary key is the common one. `user_id=0` is falsy, so without this check
-            # it reaches the default store, and any other int reaches the warning helper
-            # and dies there with "'int' object has no attribute 'lower'". Neither says
-            # what was wrong, and one of them wrote a customer's memories somewhere else.
-            raise ValueError(
-                f"user_id must be a non-blank string; got {user_id!r}. Omit it to use the client's default "
-                "store, or pass a real store id — anything else would silently write into the default store."
-            )
+        if user_id is not None:
+            _assert_usable_store_id(user_id)
         sid = user_id if user_id else self._user_id
         _warn_if_store_id_collapses(sid)
         return sid
@@ -1166,6 +1258,11 @@ class Client:
 
         ``user_id`` is optional — omit it to use the client's default store.
 
+        ``limit`` is 5-20, and out of range is refused rather than clamped: asking for
+        50 and silently receiving 20 reads as "that is all there is". The default is 10,
+        so a call that passes no count is unaffected. Before 2.2.35 the count was sent
+        on unchecked.
+
         ``limit`` bounds ``memories``, not the returned list. On a model that keeps
         the assistant's own words separate (Scroll 1.2+) those come back as well, so
         the list can hold more than ``limit``. They were retrieved and billed either
@@ -1208,10 +1305,11 @@ class Client:
         ``speaker`` recalls one person's words only — ``"me"`` for the assistant's own,
         or a name registered with :meth:`add_speaker`.
 
-        Both worked before this release — anything unrecognized here is merged into the
-        request body — and both are in the README. Neither was in a docstring, which is
-        what autocomplete and ``help()`` show, so the option that cuts the bill by 10×
-        was invisible exactly where a caller writing this line would look for it.
+        Both are named arguments now. They used to ride in ``**opts``, which merged
+        anything unrecognized into the request body, and they were in the README but in
+        no docstring — which is what autocomplete and ``help()`` show, so the option
+        that cuts the bill by 10× was invisible exactly where a caller writing this line
+        would look for it.
 
         ``verify`` (0–3) asks again after the first answer, up to that many times, and
         each extra pass reaches memories the earlier ones did not. No LLM runs at any
@@ -1222,18 +1320,20 @@ class Client:
         questions needing several distinct memories from far apart in the history and
         does little on a single-fact lookup.
 
-        ``max_images`` (0–5, default 1) is how many image memories the answer may carry;
-        0 asks for none. Out of range is refused rather than clamped — silently cutting
-        5 to 1 would leave you believing you got five.
+        ``max_images`` (0–5) is how many image memories the answer may carry; omit it
+        and the service uses 1, ``0`` asks for none. The MCP server defaults its own
+        tool to 0 instead, so most searches through it carry no image rows. Out of range
+        is refused rather than clamped — silently cutting 5 to 1 would leave you
+        believing you got five.
 
         Both need a capable model and are REFUSED (403) on one without it, instead of
         being accepted and quietly doing nothing.
 
-        A MISSPELLING is not caught. ``verfy=3`` is absorbed by ``**opts``, travels to
-        the API, is ignored as an unknown field and comes back 200 having re-asked
-        nothing — you paid for the search and believe verification ran. Naming the
-        arguments fixed discoverability (autocomplete, ``help()``), not this. Spell them
-        exactly.
+        A MISSPELLING is refused here, before anything is sent. ``verfy=3`` used to be
+        absorbed by ``**opts``, travel to the API, be ignored as an unknown field and
+        come back 200 having re-asked nothing — you paid for the search and believed
+        verification ran. It now raises ``ValueError`` and names the key you probably
+        meant. Pass a genuinely new option under ``extra``.
         """
         # Reserved fields win over **opts: an app that forwards untrusted input as
         # opts must not be able to override the store (user_id), query, or limit.
@@ -1348,12 +1448,17 @@ class Client:
             print(m["content"], m["is_superseded"])
         """
         user_id, memory_id = _split_id_args(user_id, memory_id)
-        if not memory_id or not isinstance(memory_id, str):
+        # `"   "` is truthy, so the old test passed it through as the id. The four
+        # sibling calls go through _require_memory_id, which refuses a blank one and
+        # returns it stripped; get did neither, so an id pasted from a log with a stray
+        # space was answered here and 404'd in TypeScript and Rust.
+        if not isinstance(memory_id, str) or not memory_id.strip():
             raise ValueError(
                 "memory_id is required — the id that add/store or list_memories returned. "
                 "Note the argument order: get(user_id, memory_id). With a store set on the "
                 'client, call get(memory_id="...").'
             )
+        memory_id = memory_id.strip()
         r = self._post(
             "/api/v1/memory/get", {"user_id": self._uid(user_id), "memory_id": memory_id}, model=model
         )
@@ -1652,7 +1757,7 @@ class Client:
         ``memory`` is ``"shared"`` (models that read the same store) or ``"isolated"``
         (a model with its own dedicated memory). Needs no API key.
         """
-        return self._request("GET", "/api/v1/models").get("models") or []
+        return _as_list(self._request("GET", "/api/v1/models").get("models"))
 
     def list_engrams(self) -> dict:
         """The engrams (and delivery forms) the selected model can actually run.
@@ -1671,8 +1776,8 @@ class Client:
         """
         r = self._request("GET", "/api/v1/engram")
         return {
-            "engrams": r.get("engrams") or [],
-            "forms": r.get("forms") or [],
+            "engrams": _as_list(r.get("engrams")),
+            "forms": _as_list(r.get("forms")),
             "note": r.get("note"),
         }
 
@@ -1696,7 +1801,7 @@ class Client:
 
     def list_stores(self) -> list[dict]:
         """List your stores: ``[{"user_id", "created_at"}, ...]`` (``default`` first)."""
-        return self._request("GET", "/api/v1/memory/collections").get("collections") or []
+        return _as_list(self._request("GET", "/api/v1/memory/collections").get("collections"))
 
     def delete_store(self, user_id: str) -> dict:
         """Delete a store and ALL its memories. Returns ``{"user_id", "status"}``."""
@@ -1777,20 +1882,37 @@ class Client:
                     time.sleep(_sleep_within(_backoff(attempt, None), deadline_at, self._deadline))
                     continue
                 raise APIConnectionError(0, f"network error: {e}") from e
-            if 300 <= r.status_code < 400:
-                raise _make_error(
-                    r.status_code, "the API answered with a redirect; refusing to follow it"
-                )
-            if r.status_code in _RETRY_ALWAYS and attempt + 1 < attempts:
-                retry_after = r.headers.get("Retry-After")
-                r.close()
-                time.sleep(_sleep_within(_backoff(attempt, retry_after), deadline_at, self._deadline))
-                continue
-            if r.status_code >= 400:
-                # Capped like every other error body: the response is streamed now,
-                # so ``r.text`` would buffer whatever a broken host sends.
-                raise _parse_error(r.status_code, Client._read_capped(r))
-            data = Client._read_capped_bytes(r)
+            # `stream=True` keeps a pooled connection checked out until the response is
+            # closed, and two paths here used to raise without closing: the redirect, and
+            # the size cap inside the reader. A misconfigured base_url behind a proxy that
+            # 302s every call then leaked one connection per get_image() until GC, and
+            # urllib3 began logging "Connection pool is full, discarding connection".
+            # The JSON path has always had this `finally`.
+            closed = False
+            try:
+                # The quota this call just spent. rate_limit promises the MOST RECENT
+                # call; the async client and Rust record it here and this one did not, so
+                # a sync image loop self-throttling on it read a snapshot frozen at
+                # whatever JSON call came before — or None.
+                self._rate_limit = _parse_rate_limit(r.headers) or self._rate_limit
+                if 300 <= r.status_code < 400:
+                    raise _make_error(
+                        r.status_code, "the API answered with a redirect; refusing to follow it"
+                    )
+                if r.status_code in _RETRY_ALWAYS and attempt + 1 < attempts:
+                    retry_after = r.headers.get("Retry-After")
+                    r.close()
+                    closed = True
+                    time.sleep(_sleep_within(_backoff(attempt, retry_after), deadline_at, self._deadline))
+                    continue
+                if r.status_code >= 400:
+                    # Capped like every other error body: the response is streamed now,
+                    # so ``r.text`` would buffer whatever a broken host sends.
+                    raise _parse_error(r.status_code, Client._read_capped(r))
+                data = Client._read_capped_bytes(r)
+            finally:
+                if not closed:
+                    r.close()
             break
         else:  # pragma: no cover — the loop always breaks or raises
             raise RuntimeError("retries exhausted")
@@ -2050,7 +2172,13 @@ class AsyncClient:
         # "no budget", the same fallback the timeout above takes.
         self._deadline = deadline if isinstance(deadline, (int, float)) and deadline > 0 else None
         self._model = _check_model(model)
-        self._user_id = user_id or self.DEFAULT_USER
+        # The same guard _uid applies per call. It used to live only there, so the
+        # constructor and with_user() — the documented per-tenant pattern — walked past
+        # it: user_id=0 and user_id="" became the shared `default` store with no warning,
+        # while add(text, user_id=0) raised. A destination that depends on WHICH door the
+        # id came through is the worst kind of silent redirect.
+        _assert_usable_store_id(user_id)
+        self._user_id = user_id
         self._retries = max(0, int(retries))
         self._rate_limit: Optional[dict] = None
         self._httpx = httpx
@@ -2143,16 +2271,8 @@ class AsyncClient:
         # is a bug at the call site and must not silently land in the default store.
         # (This copy had no docstring, which is why a text-matched fix skipped it — the
         # two clients drifting apart is exactly what the parity tests exist to catch.)
-        if user_id is not None and (not isinstance(user_id, str) or not user_id.strip()):
-            # Not just blank: any PASSED value that is not a usable store id. An integer
-            # primary key is the common one. `user_id=0` is falsy, so without this check
-            # it reaches the default store, and any other int reaches the warning helper
-            # and dies there with "'int' object has no attribute 'lower'". Neither says
-            # what was wrong, and one of them wrote a customer's memories somewhere else.
-            raise ValueError(
-                f"user_id must be a non-blank string; got {user_id!r}. Omit it to use the client's default "
-                "store, or pass a real store id — anything else would silently write into the default store."
-            )
+        if user_id is not None:
+            _assert_usable_store_id(user_id)
         sid = user_id if user_id else self._user_id
         _warn_if_store_id_collapses(sid)
         return sid
@@ -2300,12 +2420,17 @@ class AsyncClient:
         Same visibility as ``list_memories``; unknown, foreign, or internal-only ids
         raise ``NotFoundError``."""
         user_id, memory_id = _split_id_args(user_id, memory_id)
-        if not memory_id or not isinstance(memory_id, str):
+        # `"   "` is truthy, so the old test passed it through as the id. The four
+        # sibling calls go through _require_memory_id, which refuses a blank one and
+        # returns it stripped; get did neither, so an id pasted from a log with a stray
+        # space was answered here and 404'd in TypeScript and Rust.
+        if not isinstance(memory_id, str) or not memory_id.strip():
             raise ValueError(
                 "memory_id is required — the id that add/store or list_memories returned. "
                 "Note the argument order: get(user_id, memory_id). With a store set on the "
                 'client, call get(memory_id="...").'
             )
+        memory_id = memory_id.strip()
         r = await self._post(
             "/api/v1/memory/get", {"user_id": self._uid(user_id), "memory_id": memory_id}, model=model
         )
@@ -2528,14 +2653,14 @@ class AsyncClient:
         """The engrams + delivery forms the selected model can run (see sync client)."""
         r = await self._request("GET", "/api/v1/engram")
         return {
-            "engrams": r.get("engrams") or [],
-            "forms": r.get("forms") or [],
+            "engrams": _as_list(r.get("engrams")),
+            "forms": _as_list(r.get("forms")),
             "note": r.get("note"),
         }
 
     async def list_models(self) -> list[dict]:
         """Available models. Needs no API key."""
-        return (await self._request("GET", "/api/v1/models")).get("models") or []
+        return _as_list((await self._request("GET", "/api/v1/models")).get("models"))
 
     async def create_store(self, user_id: Optional[str] = None) -> dict:
         """Create a store (explicit, idempotent). Returns ``{"user_id", "status"}``."""
@@ -2543,7 +2668,7 @@ class AsyncClient:
 
     async def list_stores(self) -> list[dict]:
         """List your stores (``default`` first)."""
-        return (await self._request("GET", "/api/v1/memory/collections")).get("collections") or []
+        return _as_list((await self._request("GET", "/api/v1/memory/collections")).get("collections"))
 
     async def delete_store(self, user_id: str) -> dict:
         """Delete a store and ALL its memories."""
@@ -2611,14 +2736,41 @@ class AsyncClient:
     async def _request_bytes(self, path: str, body: dict, *, model: Optional[str] = None) -> tuple[bytes, str]:
         """One request that answers with BYTES rather than JSON — see ``Client._request_bytes``.
 
-        No retries: this is a read, but the body can be megabytes and a blind retry would
-        pay for it twice.
+        Retries 429 and connect-level failures, like every other call. The old note here
+        said "no retries — the body can be megabytes and a blind retry would pay for it
+        twice", which is true of a retry AFTER bytes have arrived and not of these two: a
+        429 carries no image, and a connect failure never reached the server. The sync
+        client and the TypeScript client both corrected this; this one had not, so
+        ``async for m in mem.iter_images(): await mem.get_image(...)`` — the most
+        rate-limit-prone loop in the SDK — died on the first 429 the others rode through.
         """
         eff_model = _check_model(model) if model else self._model
         headers = {"X-WOS-Model": eff_model} if eff_model else None
+        attempts = self._retries + 1
+        deadline_at = _deadline_at(self._deadline)
+        for attempt in range(attempts):
+            try:
+                return await self._request_bytes_once(path, body, headers, deadline_at)
+            except RateLimitError as e:
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(
+                    _sleep_within(_backoff(attempt, getattr(e, "_retry_after", None)), deadline_at, self._deadline)
+                )
+            except APIConnectionError as e:
+                # Only a failure that never reached the server. A read timeout is
+                # ambiguous and a mid-stream drop may already have been billed.
+                if attempt + 1 >= attempts or not getattr(e, "_never_sent", False):
+                    raise
+                await asyncio.sleep(_sleep_within(_backoff(attempt), deadline_at, self._deadline))
+        raise APIConnectionError(0, "retries exhausted")  # pragma: no cover — the loop returns or raises
+
+    async def _request_bytes_once(
+        self, path: str, body: dict, headers: Optional[dict], deadline_at: Optional[float]
+    ) -> tuple[bytes, str]:
         # Outside the try: `except Exception` below would relabel an exhausted budget
         # as a network error, which is the one thing it certainly is not.
-        _budget = _attempt_budget(self._timeout, _deadline_at(self._deadline), self._deadline)
+        _budget = _attempt_budget(self._timeout, deadline_at, self._deadline)
         try:
             # Streamed, like the sync client. ``post()`` is httpx's non-streaming path:
             # it awaits ``aread()`` and DECOMPRESSES the whole body before returning, so
@@ -2631,18 +2783,30 @@ class AsyncClient:
             )
             r = await self._http.send(req, stream=True)
         except Exception as e:  # httpx transport errors
-            raise APIConnectionError(0, f"network error: {e}") from e
+            err = APIConnectionError(0, f"network error: {e}")
+            # Connect-level only: the request never left, so re-sending cannot
+            # double-process anything. Everything else stays final.
+            err._never_sent = isinstance(e, (self._httpx.ConnectError, self._httpx.ConnectTimeout))
+            raise err from e
         # A streamed response holds a connection until it is closed, and ``r.text``
         # raises on one that has not been read — so both the error path and the happy
         # path go through the capped reader, and the close happens either way.
         try:
+            retry_after = r.headers.get("Retry-After")
+            self._rate_limit = _parse_rate_limit(r.headers) or self._rate_limit
             if 300 <= r.status_code < 400:
                 raise _make_error(
                     r.status_code, "the API answered with a redirect; refusing to follow it"
                 )
             data = await self._read_capped_bytes(r)
             if r.status_code >= 400:
-                raise _parse_error(r.status_code, data.decode("utf-8", "replace"))
+                err = _parse_error(r.status_code, data.decode("utf-8", "replace"))
+                # Carried on the exception, not on the client. Two awaits sit between
+                # reading this header and the retry that needs it, so a second concurrent
+                # image call could overwrite a shared field in between and make this one
+                # sleep on the wrong Retry-After.
+                err._retry_after = retry_after
+                raise err
             if not data:
                 raise WosError(r.status_code, "empty image body — the service returned no bytes")
             ctype = r.headers.get("content-type", "application/octet-stream")
@@ -2660,8 +2824,6 @@ class AsyncClient:
         model: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> dict:
-        import asyncio
-
         eff_model = _check_model(model) if model else self._model
         headers = {"X-WOS-Model": eff_model} if eff_model else None
         idem = _idem_headers(idempotency_key)
@@ -2674,6 +2836,7 @@ class AsyncClient:
             # Outside the try for the same reason as the bytes path: an exhausted
             # budget must not come back wearing "network error".
             _budget = _attempt_budget(self._timeout, deadline_at, self._deadline)
+            pending_delay: Optional[float] = None
             try:
                 async with self._http.stream(
                     method, f"{self._base}{path}", json=json_body, params=params, headers=headers,
@@ -2690,8 +2853,15 @@ class AsyncClient:
                             "%s %s -> %d — retrying in %.1fs (attempt %d/%d)",
                             method, path, r.status_code, delay, attempt + 1, attempts,
                         )
-                        await asyncio.sleep(_sleep_within(delay, deadline_at, self._deadline))
-                        continue
+                        # Sleep AFTER the `async with` releases the connection, not inside
+                        # it. Sleeping here kept one pooled connection checked out for the
+                        # whole backoff — with `Retry-After: 30` and enough concurrent
+                        # tasks that is the entire httpx pool asleep, and every other
+                        # request in the process fails PoolTimeout, un-retried. The sync
+                        # client closes first for this reason (`r.close()` before sleep).
+                        pending_delay = _sleep_within(delay, deadline_at, self._deadline)
+                        # Leave the `async with`; the sleep happens below, unpooled.
+                        raise _Backoff
                     if 300 <= r.status_code < 400:
                         raise WosError(
                             r.status_code,
@@ -2736,6 +2906,11 @@ class AsyncClient:
                     if r.headers.get("Idempotent-Replayed") == "true" and "replayed" not in data:
                         data["replayed"] = True
                     return data
+            except _Backoff:
+                # The status said retry. We are out of the `async with`, so the pooled
+                # connection is back before we sleep on it.
+                await asyncio.sleep(pending_delay or 0.0)
+                continue
             except (self._httpx.ConnectError, self._httpx.ConnectTimeout) as e:
                 # Connect-level failure — the server never processed anything.
                 if attempt + 1 < attempts:

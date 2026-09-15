@@ -230,12 +230,17 @@ class ClientTests(unittest.TestCase):
         # one field reachable via opts is max_results (param is named `limit`),
         # so pin that the limit param wins while other opts still pass through.
         srv, mem = self.make([(200, {}, '{"memories": []}')])
-        mem.search("real-query", user_id="alice", limit=7, max_results=999, filters={"categories": ["x"]})
+        with self.assertRaises(ValueError) as e:
+            mem.search("real-query", user_id="alice", limit=7, max_results=999)
+        self.assertIn("set by the call", str(e.exception))
+        self.assertEqual(srv.seen, [], "a refused option must not reach the wire")
+
+        mem.search("real-query", user_id="alice", limit=7, filters={"categories": ["x"]})
         body = json.loads(srv.seen[0]["body"])
         self.assertEqual(body["user_id"], "alice")
         self.assertEqual(body["query"], "real-query")
-        self.assertEqual(body["max_results"], 7)  # limit param wins over opts' 999
-        self.assertEqual(body["filters"], {"categories": ["x"]})  # non-reserved opts still pass through
+        self.assertEqual(body["max_results"], 7)
+        self.assertEqual(body["filters"], {"categories": ["x"]})
 
     def test_search_count_out_of_range_is_refused_not_adjusted(self):
         # `recall` has always been 5..20 and the service refuses anything else.
@@ -312,23 +317,27 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(body["max_images"], 5)
         self.assertEqual(body["user_id"], "alice")
 
-    def test_a_misspelled_verify_still_travels_silently(self):
-        # Naming the arguments does not catch a typo while the **opts catch-all is
-        #   there. verfy=3 is absorbed into opts and goes out as-is; the API ignores a
-        #   field it does not know and answers 200 — so re-ask never ran and the caller
-        #   believes it did.
-        #
-        #   This test does not **fix** that hole, it keeps it visible. Naming the
-        #   arguments bought autocomplete and help(), nothing more; the only thing that
-        #   actually stops a typo is Rust's SearchOpts struct. Closing it here means
-        #   warning on unknown top-level options the way filters already does
-        #   (_warn_on_unknown_filters).
+    def test_a_misspelled_option_is_refused_before_the_wire(self):
+        # verfy=3 used to be absorbed into opts and sent as-is. The API ignores a field
+        #   it does not know and answers 200, so re-ask never ran while the caller
+        #   believed it had — a paid feature off, and nothing to see. Filters only warn
+        #   because a wrong filter still returns memories; this one returns a normal
+        #   answer that is quietly worse.
         srv, mem = self.make([(200, {}, '{"memories": []}')])
-        mem.search("q", user_id="alice", verfy=3)
+        with self.assertRaises(ValueError) as e:
+            mem.search("q", user_id="alice", verfy=3)
+        self.assertIn("verfy", str(e.exception))
+        self.assertIn("verify", str(e.exception))  # names what was meant
+        self.assertEqual(srv.seen, [], "a refused option must not reach the wire")
+
+    def test_extra_is_the_forward_compatible_way_through(self):
+        # Refusing unknown keys would otherwise mean a new service option cannot be
+        #   used until this client learns it. `extra` is the declared way past.
+        srv, mem = self.make([(200, {}, '{"memories": []}')])
+        mem.search("q", user_id="alice", extra={"future_option": 1})
         body = json.loads(srv.seen[0]["body"])
-        self.assertEqual(body.get("verfy"), 3,
-                         "if the hole is closed, delete this test and assert the warning")
-        self.assertNotIn("verify", body)
+        self.assertEqual(body.get("future_option"), 1)
+        self.assertNotIn("extra", body)
 
     def test_omitting_them_sends_neither_key(self):
         # Re-ask is billed by what it delivers. Slip a default in here and the bill
@@ -800,6 +809,21 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data, b"PNGBYTES")
         self.assertTrue(isinstance(ctype, str))
 
+    async def test_get_image_retries_a_429_on_the_async_transport(self):
+        # The async image retry lived in _request_bytes, and `asyncio` was imported
+        # inside _request only — a function-local name that never reached this one.
+        # The first 429 raised NameError while handling RateLimitError, so neither
+        # `except RateLimitError` nor `except WosError` caught it.
+        srv, mem = self.make([
+            (429, {"Retry-After": "0"}, '{"error": "rate limited"}'),
+            (200, {"Content-Type": "image/webp"}, "PNGBYTES"),
+        ])
+        async with mem:
+            data, mime = await mem.get_image("alice", "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(data, b"PNGBYTES")
+        self.assertIn("image/webp", mime)
+        self.assertEqual(len(srv.seen), 2, "the 429 must have been retried")
+
     async def test_retries_429_then_succeeds(self):
         srv, mem = self.make([
             (429, {"Retry-After": "0"}, '{"error": "rate limited"}'),
@@ -1227,7 +1251,11 @@ class CacheControlTest(unittest.TestCase):
         self.addCleanup(srv.shutdown)
         mem = Client("wos-test-xxxxxxxxxx", base_url=base)
         untrusted = {"cache_control": {"ttl": "1h"}, "max_results": 999}
-        mem.search("real", "alice", **untrusted)
+        with self.assertRaises(ValueError) as e:
+            mem.search("real", "alice", **untrusted)
+        self.assertIn("max_results", str(e.exception))
+
+        mem.search("real", "alice", cache_control={"ttl": "1h"})
         sent = self.body(srv)
         self.assertEqual(sent["user_id"], "alice")
         self.assertEqual(sent["query"], "real")
@@ -1481,3 +1509,71 @@ class DeadlineTests(unittest.TestCase):
         # budget", the same fallback a non-positive timeout takes.
         srv, mem = self.make([(200, {}, '{"memories": []}')], deadline=0)
         self.assertEqual(mem.search("q", user_id="alice"), [])
+
+
+
+class BuilderStoreIdGuardTest(unittest.TestCase):
+    """The per-call guard lived only in _uid(), so the BUILDER form walked past it:
+    Client(user_id=0) and with_user("") became the shared `default` store with no
+    warning, while add(text, user_id=0) raised. with_user is the documented per-tenant
+    pattern, so a failed session lookup wrote one end-user's memories into a store
+    everyone on the account can read."""
+
+    BAD = ("", " ", "\t", None, 0, 42, 3.5, [], {})
+
+    def test_with_user_refuses_every_unusable_id(self):
+        for cls in (Client, AsyncClient):
+            bound = cls("wos-test-xxxxxxxxxx", user_id="tenant-A")
+            for bad in self.BAD:
+                with self.assertRaises(ValueError, msg=f"{cls.__name__}.with_user({bad!r})") as cm:
+                    bound.with_user(bad)
+                self.assertIn("non-blank string", str(cm.exception))
+
+    def test_constructor_refuses_every_unusable_id(self):
+        for cls in (Client, AsyncClient):
+            for bad in self.BAD:
+                with self.assertRaises(ValueError, msg=f"{cls.__name__}(user_id={bad!r})") as cm:
+                    cls("wos-test-xxxxxxxxxx", user_id=bad)
+                self.assertIn("non-blank string", str(cm.exception))
+
+    def test_the_zero_setup_path_and_other_clones_still_work(self):
+        for cls in (Client, AsyncClient):
+            self.assertEqual(cls("wos-test-xxxxxxxxxx")._user_id, "default")
+            bound = cls("wos-test-xxxxxxxxxx", user_id="tenant-A")
+            self.assertEqual(bound.with_model("tablet-2")._user_id, "tenant-A")
+            self.assertEqual(bound.with_user("tenant-B")._user_id, "tenant-B")
+
+
+class KeyCharsetTest(unittest.TestCase):
+    """A key pasted from a rich-text doc has had its hyphen turned into an en dash. That
+    used to travel into http.client and die there as UnicodeEncodeError — not a WosError,
+    so `except WosError` missed it, and the message never said "api_key"."""
+
+    def test_a_non_latin1_key_is_refused_with_a_useful_message(self):
+        for bad in ("wos\u2013live\u2013" + "a" * 30, "wos-live-\u00e9" + "a" * 30, "wos-live-\uff0d" + "a" * 30):
+            with self.assertRaises(ValueError) as cm:
+                Client(bad)
+            self.assertIn("api_key", str(cm.exception))
+            self.assertIn("non-ASCII", str(cm.exception))
+
+    def test_an_ordinary_key_still_works(self):
+        self.assertTrue(Client("wos-live-" + "k" * 40))
+
+
+class ListShapeTest(unittest.TestCase):
+    """`x or []` only replaces a FALSY value — a truthy wrong type slips through as a
+    dict and blows up in the CALLER's for-loop. _as_list exists for this; six sites
+    still used the old form."""
+
+    def test_a_dict_where_a_list_was_promised_becomes_an_empty_list(self):
+        for path_body, call in (
+            ('{"models": {"tablet-2": {"id": "tablet-2"}}}', lambda m: m.list_models()),
+            ('{"collections": {"a": 1}}', lambda m: m.list_stores()),
+            ('{"engrams": "oops"}', lambda m: m.list_engrams()["engrams"]),
+        ):
+            srv, base = scripted_server([(200, {}, path_body)])
+            self.addCleanup(srv.shutdown)
+            got = call(Client("wos-test-xxxxxxxxxx", base_url=base))
+            self.assertEqual(got, [], path_body)
+            for _ in got:  # must be iterable as the annotation promises
+                pass

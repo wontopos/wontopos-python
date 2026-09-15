@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wontopos"
-version = "2.2.37"
+version = "2.2.38"
 description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."
 readme = "README.md"
 authors = [{ name = "Wontopos" }]
