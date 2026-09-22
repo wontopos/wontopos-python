@@ -6,14 +6,69 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
-Four patches have bent that rule so far, deliberately and with the reason written
-down in each entry. 2.2.31 removed the `Wos` client: an exported name disappeared
-inside the minor line. 2.2.34 moves the default engine: nothing was removed and no
-signature changed, but a caller who names no model gets different results than before.
-2.2.35 gives `search` the count range `recall` has always had, so a call that passed
-30 was answered and now raises instead. 2.2.38 refuses an option TypeScript and Python do not know, and refuses a blank store
-id in all three — both were accepted and sent before. All four are named here rather than left for a reader to
-notice — a rule you can bend without saying so is not a rule.
+## 2.2.39 — 2026-09-18
+
+**Rust: the lockfile moves to rustls 0.23.45, for RUSTSEC-2026-0285.** That does not
+reach you. This client uses reqwest's default TLS backend, `native-tls`, and a
+library's lockfile is ignored by whoever depends on it. If another crate in your tree
+turns on reqwest's rustls backend, update rustls in your own lockfile with
+`cargo update -p rustls`.
+
+**408 and 504 now retry on idempotent methods**, as 502 and 503 do. No write is
+retried on any of them. 429 is retried on every method, as before.
+
+**Python and TypeScript retry an idempotent method when the connection dies while the
+body is being read.** A write is not retried then, because the first attempt may
+already have landed.
+
+**`export_images(user_id, page_size=…)` / `exportImages(userId, { pageSize })`**, new
+in all three: every image in a store as one list, the image-side pair of
+`export_memories`.
+
+`iter_images` / `iterImages` is unchanged. In Python and TypeScript it yields one image
+at a time and fetches pages behind the scenes; in Rust it returns the whole list. To
+page in Rust, call `list_images` and pass back both cursors it returned, `before` and
+`skip_ids`.
+
+**Rust: an empty `add_bulk` category is sent as passed.** It used to be rewritten to
+`general`. **This changes what a Rust caller's data is filed under.**
+
+**Rust: `add_bulk_with` and `add_bulk_with_idempotent`.** The first takes extra body
+fields such as a `timestamp`, so a backfill can be dated; the second takes them
+together with an idempotency key.
+
+**Rust: `add_with_idempotent`** takes an image (or other extra fields) and an
+idempotency key in one call.
+
+**TypeScript: a refused argument arrives as a rejection.** Every method that returns a
+promise is `async` now. **A `.catch()` that never fired will start firing**, and a
+`try`/`catch` around a call you do not await stops catching. Await the call, or handle
+the rejection.
+
+**TypeScript: `engram` refuses an option it does not know**, as `recall` does. A
+misspelled option used to be dropped without a word.
+
+**`get_image` raises `APIConnectionError` when the body stops arriving**, instead of a
+raw transport error (Python and TypeScript). On an error response it reports the
+status: a 404 whose body dies mid-read is `NotFoundError` from `get_image`, and on the
+async Python client a 429 whose body dies is now retried.
+
+**Rust: a field that will not convert falls back to its default** instead of taking the
+whole record out of the list.
+
+**Replies keep fields this version does not name.** Rust's `recall` puts them in
+`RecallResponse.extra`; `list_engrams` in Python and TypeScript returns the reply with
+only its promised fields normalised.
+
+**Rust: `RecallResponse` is `#[non_exhaustive]`.** Adding `extra` already breaks a
+pattern that names every field, and a struct literal; marking it means later fields do
+not break it again. Destructure with `..` and build one with `serde_json::from_value`.
+
+**Rust: a caller's own mistake is `ErrorKind::BadRequest`** (status 400), where an
+argument out of range used to be `Other`. An exhausted deadline is status 0, which is
+`ErrorKind::Connection`. **A `match` arm on `Other` that caught these will stop.**
+
+Comments and docstrings were shortened throughout these files.
 
 ## 2.2.38 — 2026-09-15
 

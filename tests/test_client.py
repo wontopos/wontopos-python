@@ -21,7 +21,15 @@ import requests
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import wontopos
-from wontopos import APIConnectionError, AsyncClient, Client, WosError, __version__
+from wontopos import (
+    APIConnectionError,
+    AsyncClient,
+    Client,
+    NotFoundError,
+    RateLimitError,
+    WosError,
+    __version__,
+)
 
 try:
     import httpx  # noqa: F401
@@ -67,10 +75,22 @@ def scripted_server(script):
 
 
 def dropping_server(script):
-    """Raw-socket server: for each script entry, accept ONE connection; a None
-    entry reads the request head then closes WITHOUT responding (a mid-stream
-    drop); a string entry is served as a normal 200 response. Returns
-    (accept_counter_list, base_url)."""
+    """Raw-socket server: for each script entry, accept ONE connection.
+
+    ``None``       — read the request head, close WITHOUT responding. This is the
+                     CONNECT/HEADER phase, not mid-stream; the docstring used to call
+                     it a mid-stream drop, and the parity test that relied on it
+                     therefore never exercised the body reader at all.
+    ``"TRUNCATE"`` — send a 200 head promising 200 bytes, send 5, then close. THIS is
+                     a mid-body drop: the response existed and the body did not finish.
+    ``(code, ct, s)`` — send that status and content-type with ``s`` as the whole body.
+    ``(code, "TRUNCATE")`` — the same mid-body drop under an ERROR status. The status
+                     arrived and the message body did not, which is the case where the
+                     two have to be told apart: the read failed, but the status is what
+                     the caller asked about.
+    any other str  — served as a normal 200 response.
+
+    Returns (accept_counter_list, base_url)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -92,7 +112,28 @@ def dropping_server(script):
                     if not chunk:
                         break
                     data += chunk
-                if entry is not None:
+                if entry == "TRUNCATE":
+                    sock.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 200\r\nConnection: close\r\n\r\n"
+                        b"12345"
+                    )
+                elif isinstance(entry, tuple) and entry[1] == "TRUNCATE":
+                    sock.sendall(
+                        f"HTTP/1.1 {entry[0]} ERR\r\n".encode()
+                        + b"Content-Type: application/json\r\nRetry-After: 0\r\n"
+                        b"Content-Length: 200\r\nConnection: close\r\n\r\n"
+                        b"12345"
+                    )
+                elif isinstance(entry, tuple):
+                    code, ctype, payload = entry
+                    raw = payload.encode()
+                    sock.sendall(
+                        f"HTTP/1.1 {code} OK\r\nContent-Type: {ctype}\r\n".encode()
+                        + f"Content-Length: {len(raw)}\r\nConnection: close\r\n\r\n".encode()
+                        + raw
+                    )
+                elif entry is not None:
                     body = entry.encode()
                     sock.sendall(
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -462,8 +503,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(b2["form"], "memoir")
 
     def test_post_write_not_retried_on_5xx(self):
-        # A 502 on a POST write must NOT retry: the write may already have landed
-        # (double store / double bill). Only one request should be made.
+        # A 502 on a POST write must NOT retry: the write may already have landed,
+        # and a retry would store it twice. Only one request should be made.
         srv, mem = self.make([(502, {}, '{"error": "bad gateway"}')])
         with self.assertRaises(WosError) as cm:
             mem.add("hello", user_id="u")
@@ -478,6 +519,51 @@ class ClientTests(unittest.TestCase):
         ])
         mem.list_models()
         self.assertEqual(len(srv.seen), 2)  # retried
+
+    def test_a_long_error_envelope_keeps_its_message_and_request_id(self):
+        # The cap ran on the raw body BEFORE json.loads, so an envelope over 4096
+        # chars stopped being valid JSON and the parse fell through: a 400 whose
+        # message was two words arrived as cut-off JSON text, with no
+        # request_id — the one value support asks for.
+        env = json.dumps({"type": "error", "error": {
+            "type": "invalid_request_error", "message": "bad input",
+            "request_id": "req_ABC123", "detail": "x" * 5000}})
+        srv, mem = self.make([(400, {}, env)])
+        with self.assertRaises(WosError) as cm:
+            mem.stats()
+        self.assertEqual(cm.exception.message, "bad input")
+        self.assertEqual(cm.exception.request_id, "req_ABC123")
+
+    def test_a_huge_error_string_is_still_capped(self):
+        # The other half: capping after the parse must still bound the message.
+        srv, mem = self.make([(400, {}, json.dumps({"error": "Z" * 9000}))])
+        with self.assertRaises(WosError) as cm:
+            mem.stats()
+        self.assertLessEqual(len(cm.exception.message), 4200)
+        self.assertTrue(cm.exception.message.endswith("…(truncated)"))
+
+    def test_get_retried_on_504_and_408(self):
+        # Same rule as 502/503, applied to the two the set used to miss. A gateway
+        # that stopped waiting (504) and an intermediary-authored 408 are both
+        # ambiguous for a write and both safe for an idempotent read.
+        for status in (504, 408):
+            with self.subTest(status=status):
+                srv, mem = self.make([
+                    (status, {"Retry-After": "0"}, "{}"),
+                    (200, {}, '{"models": []}'),
+                ])
+                mem.list_models()
+                self.assertEqual(len(srv.seen), 2, f"{status} was not retried")
+
+    def test_post_write_not_retried_on_504_or_408(self):
+        # The other half: widening the set must not start retrying writes.
+        for status in (504, 408):
+            with self.subTest(status=status):
+                srv, mem = self.make([(status, {}, '{"error": "gateway"}')])
+                with self.assertRaises(WosError) as cm:
+                    mem.add("hello", user_id="u")
+                self.assertEqual(cm.exception.status, status)
+                self.assertEqual(len(srv.seen), 1, f"{status} retried a write")
 
     def test_backoff_parses_http_date_retry_after(self):
         from email.utils import formatdate
@@ -530,8 +616,8 @@ class ClientTests(unittest.TestCase):
 
     def test_post_not_retried_on_midstream_drop(self):
         # The server accepts, reads the request, then drops the connection with
-        # no response. For a POST the write may already have landed (and billed)
-        # server-side — the client must NOT fire it again.
+        # no response. For a POST the write may already have landed — the client
+        # must NOT fire it again.
         accepted, base = dropping_server([None, None])
         mem = Client("wos-test-xxxxxxxxxx", base_url=base, retries=1)
         with self.assertRaises(wontopos.APIConnectionError):
@@ -786,10 +872,9 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         return srv, AsyncClient("wos-test-xxxxxxxxxx", base_url=base, **kw)
 
     async def test_get_accepts_the_id_alone_like_sync(self):
-        # sync had the id recovery (`_split_id_args`) and async did not. `get(memory_id)`
-        #   — what a client with a default store actually calls — worked on sync and died
-        #   with ValueError on async.
-        #   And `test_same_surface_as_sync` passed it, because that test compares names
+        # `get(memory_id)` — what a client with a default store actually calls — has to
+        #   accept the id alone, through `_split_id_args`.
+        #   `test_same_surface_as_sync` does not cover it: that test compares names
         #   through dir(). Matching names with different bodies still breaks callers.
         srv, mem = self.make([(200, {}, '{"memory": {"id": "m1"}}')])
         async with mem:
@@ -898,17 +983,15 @@ class Base64ShapeTest(unittest.TestCase):
     def test_plain_base64_is_untouched(self):
         self.assertEqual(self._norm("QUJDRA=="), "QUJDRA==")
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RetriesAliasTest(unittest.TestCase):
-    """`retries` (Python) and `maxRetries` (TypeScript) are one option that had two names.
+    """`retries` and `maxRetries` are one option that had two names.
 
-    The docs say the three SDKs ship together as "one surface", so porting TypeScript to
-    Python raised a TypeError right here. The other direction (Python -> TS) was worse:
-    TypeScript ignores unknown keys on an options object at runtime, so **the retry
-    setting vanished silently.** Both names are accepted.
+    The SDKs ship as one surface, so code ported between them names this setting either
+    way, and a name that is not recognised is worse than an error: an options object can
+    drop an unknown key at runtime, and **the retry setting vanishes silently.** Both
+    names are accepted.
     """
 
     def test_alias_sets_retries(self):
@@ -961,11 +1044,10 @@ class ListEngramsTest(unittest.TestCase):
 
 
 class EmptyBodyTest(unittest.TestCase):
-    """The three SDKs treated a body-less response differently: on the same `204 No
-    Content` TypeScript succeeded with `{}` while Python and Rust raised "invalid JSON".
-    They ship as one surface, so both directions are settled here — a body may be absent
-    only when the status code says so (204/205/304), and an empty body on any other 2xx
-    is a real fault (a proxy truncating bodies, say) that must not pass as success."""
+    """A response with no body needs one answer, and this settles both directions: a body
+    may be absent only when the status code says so (204/205/304), and an empty body on
+    any other 2xx is a real fault (a proxy truncating bodies, say) that must not pass as
+    success."""
 
     def make(self, script):
         srv, base = scripted_server(script)
@@ -993,7 +1075,7 @@ class EmptyBodyTest(unittest.TestCase):
 
 
 class IdempotencyKeyTest(unittest.TestCase):
-    """Idempotency keys already existed in the backend (across the whole memory plane),
+    """Idempotency keys already existed in the service, on every write route,
     This pins three things: that the header actually goes out, that a malformed key is
     refused before the network, and that the key is not swallowed by ``**metadata`` and
     stored on the memory."""
@@ -1216,8 +1298,8 @@ class CacheControlTest(unittest.TestCase):
     """No Python docstring mentioned the route to the 0.1x rate.
 
     It always worked — ``search(**opts)`` merges unknown keys into the body — so it
-    went unfound while repeated queries billed at full price. Now that the docstring
-    promises it, a test has to hold the wire shape it promises.
+    went unfound, and callers paid the full rate for queries that did not need it.
+    Now that the docstring promises it, a test has to hold the wire shape it promises.
     """
 
     @staticmethod
@@ -1370,15 +1452,114 @@ class StoreIdWarningBoundTest(unittest.TestCase):
         self.assertEqual(len(wontopos._warned_store_ids), 0, "an already-canonical id has no reason to consume the cap")
 
 
+class StalledBodyIsNotRetriedTest(unittest.TestCase):
+    """A body that STOPS ARRIVING is not the same as a body that was cut off.
+
+    The body-drop retry was written as ``except Exception``, which is every failure the
+    reader can raise — including a read timeout. A drop means nothing more is coming, so
+    replaying an idempotent read costs one extra request; a timeout means the server may
+    still be working, so a replay adds load to a request that could yet be answered. The
+    other three clients exclude timeouts, so a stalled server answered one way in three
+    of them and another way here, while the comments in all four promised the same rule.
+
+    Counting ACCEPTS instead of REQUESTS hides this: keep-alive puts the retries on one
+    connection, so the first measurement of it read 1 and the bug was three.
+    """
+
+    def stalling_server(self, stall=4.0):
+        """A head promising 200 bytes and then nothing — the body read runs out of time."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(16)
+        requests_seen = []
+
+        def handle(sock):
+            try:
+                while True:
+                    data = sock.recv(65536)
+                    if not data:
+                        return
+                    requests_seen.append(1)
+                    sock.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 200\r\n\r\n"
+                    )
+                    time.sleep(stall)
+            except OSError:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        def run():
+            while True:
+                try:
+                    sock, _ = srv.accept()
+                except OSError:
+                    return
+                threading.Thread(target=handle, args=(sock,), daemon=True).start()
+
+        threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(srv.close)
+        return requests_seen, f"http://127.0.0.1:{srv.getsockname()[1]}"
+
+    def test_a_read_timeout_in_the_body_is_not_retried(self):
+        seen, base = self.stalling_server()
+        mem = Client("wos-test-xxxxxxxxxx", user_id="u", base_url=base, retries=2, timeout=1.0)
+        with self.assertRaises(APIConnectionError):
+            mem.list_stores()
+        time.sleep(0.3)  # the handler threads append before the client gives up
+        self.assertEqual(len(seen), 1, "a stalled body was retried — count requests, not connections")
+
+
+@unittest.skipUnless(HAVE_HTTPX, "httpx not installed")
+class BodyDropRetryTest(unittest.IsolatedAsyncioTestCase):
+    """A drop AFTER the response head, while the body is being read.
+
+    The class below tests a drop before any response arrives — the connect/header
+    phase — and its server helper called that "mid-stream", so nothing in the suite
+    ever reached the body reader. These use the TRUNCATE entry, which sends a head and
+    then stops, and assert both clients do the same thing.
+    """
+
+    def test_sync_retries_an_idempotent_get_after_the_body_drops(self):
+        accepted, base = dropping_server(["TRUNCATE", '{"collections": []}'])
+        mem = Client("wos-test-xxxxxxxxxx", user_id="u", base_url=base, retries=2)
+        self.assertEqual(mem.list_stores(), [])
+        self.assertEqual(len(accepted), 2, "the dropped body was not retried")
+
+    def test_sync_does_not_retry_a_write_after_the_body_drops(self):
+        # The write may already have landed — replaying it stores twice.
+        accepted, base = dropping_server(["TRUNCATE", '{"id": "m1"}'])
+        mem = Client("wos-test-xxxxxxxxxx", user_id="u", base_url=base, retries=2)
+        with self.assertRaises(APIConnectionError):
+            mem.add("hello")
+        self.assertEqual(len(accepted), 1, "a write was retried")
+
+    async def test_async_agrees_with_sync_on_both(self):
+        accepted, base = dropping_server(["TRUNCATE", '{"collections": []}'])
+        async with AsyncClient("wos-test-xxxxxxxxxx", user_id="u", base_url=base, retries=2) as mem:
+            self.assertEqual(await mem.list_stores(), [])
+        self.assertEqual(len(accepted), 2)
+
+        accepted2, base2 = dropping_server(["TRUNCATE", '{"id": "m1"}'])
+        async with AsyncClient("wos-test-xxxxxxxxxx", user_id="u", base_url=base2, retries=2) as mem:
+            with self.assertRaises(APIConnectionError):
+                await mem.add("hello")
+        self.assertEqual(len(accepted2), 1)
+
+
 @unittest.skipUnless(HAVE_HTTPX, "httpx not installed")
 class SyncAsyncDropParityTest(unittest.IsolatedAsyncioTestCase):
     """Do the two clients judge the same failure the same way?
 
-    On a mid-stream drop a write must not be retried (it may already be stored and
-    billed), but an idempotent method can be — replaying it double-processes nothing.
-    Sync always did that; async caught connect-level failures only, so the same
-    dropped GET was retried by one and raised by the other. Same illness as the
-    empty-body split in 2.2.24, so: point both at one server that lies.
+    On a mid-stream drop a write must not be retried (the first attempt may already
+    have landed), but an idempotent method can be — replaying it double-processes
+    nothing. One client caught connect-level failures only, so the same dropped GET
+    was retried by one and raised by the other. So: point both at one server that lies.
     """
 
     def test_sync_retries_idempotent_on_mid_stream_drop(self):
@@ -1397,7 +1578,7 @@ class SyncAsyncDropParityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(accepted), 2, "if async does not retry the same GET, the two clients diverge")
 
     async def test_async_does_not_retry_a_write_on_mid_stream_drop(self):
-        """Aligning idempotent retries must not open writes — it may already be stored and billed."""
+        """Aligning idempotent retries must not open writes — the first attempt may already have landed."""
         accepted, base = dropping_server([None, '{"id": "m1"}'])
         mem = AsyncClient("wos-test-xxxxxxxxxx", base_url=base, retries=2)
         try:
@@ -1406,6 +1587,52 @@ class SyncAsyncDropParityTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await mem.aclose()
         self.assertEqual(len(accepted), 1, "retrying a POST can store the same memory twice")
+
+
+@unittest.skipUnless(HAVE_HTTPX, "httpx not installed")
+class ErrorStatusOutranksTheDeadBodyTest(unittest.IsolatedAsyncioTestCase):
+    """A 404 whose message body dies mid-read is still a 404.
+
+    Both halves read the error body to build the message, and a read that fails there
+    used to decide the exception. On the sync client that meant a raw transport error
+    out of ``get_image``; the first pass at it also re-raised the size cap, so a 404
+    from a host streaming past the ceiling arrived as the base ``WosError``. The async
+    half reads the body BEFORE it looks at the status, so the same 404 became
+    ``APIConnectionError`` there while the sync client raised ``NotFoundError`` — one
+    response, two exception classes, and ``except NotFoundError`` right on half the
+    time. It also cost the retry: the async wrapper retries ``RateLimitError``, and a
+    429 that never became one was never retried.
+    """
+
+    IMAGE_ID = "11111111-1111-1111-1111-111111111111"
+
+    def test_sync_reports_the_status(self):
+        _, base = dropping_server([(404, "TRUNCATE")])
+        mem = Client("wos-test-xxxxxxxxxx", base_url=base, retries=0)
+        with self.assertRaises(NotFoundError):
+            mem.get_image(memory_id=self.IMAGE_ID)
+
+    async def test_async_reports_the_same_status(self):
+        _, base = dropping_server([(404, "TRUNCATE")])
+        mem = AsyncClient("wos-test-xxxxxxxxxx", base_url=base, retries=0)
+        try:
+            with self.assertRaises(NotFoundError):
+                await mem.get_image(memory_id=self.IMAGE_ID)
+        finally:
+            await mem.aclose()
+
+    async def test_async_still_retries_a_429_whose_body_dies(self):
+        accepted, base = dropping_server(
+            [(429, "TRUNCATE"), (200, "image/webp", "PNGBYTES")]
+        )
+        mem = AsyncClient("wos-test-xxxxxxxxxx", base_url=base, retries=2)
+        try:
+            data, mime = await mem.get_image(memory_id=self.IMAGE_ID)
+        finally:
+            await mem.aclose()
+        self.assertEqual(data, b"PNGBYTES")
+        self.assertIn("image/webp", mime)
+        self.assertEqual(len(accepted), 2, "a 429 read as a connection error is never retried")
 
 
 class RecallContractTests(unittest.TestCase):
@@ -1520,9 +1747,14 @@ class BuilderStoreIdGuardTest(unittest.TestCase):
     everyone on the account can read."""
 
     BAD = ("", " ", "\t", None, 0, 42, 3.5, [], {})
+    # AsyncClient raises ImportError in its own __init__ without the async extra, which
+    # would swallow the ValueError this class is asserting. Drop it from the list rather
+    # than skipping the class — the sync guard is worth checking either way, and
+    # `python3 -m unittest discover -s tests` is what the release runs on a bare sdist.
+    CLASSES = (Client, AsyncClient) if HAVE_HTTPX else (Client,)
 
     def test_with_user_refuses_every_unusable_id(self):
-        for cls in (Client, AsyncClient):
+        for cls in self.CLASSES:
             bound = cls("wos-test-xxxxxxxxxx", user_id="tenant-A")
             for bad in self.BAD:
                 with self.assertRaises(ValueError, msg=f"{cls.__name__}.with_user({bad!r})") as cm:
@@ -1530,18 +1762,75 @@ class BuilderStoreIdGuardTest(unittest.TestCase):
                 self.assertIn("non-blank string", str(cm.exception))
 
     def test_constructor_refuses_every_unusable_id(self):
-        for cls in (Client, AsyncClient):
+        for cls in self.CLASSES:
             for bad in self.BAD:
                 with self.assertRaises(ValueError, msg=f"{cls.__name__}(user_id={bad!r})") as cm:
                     cls("wos-test-xxxxxxxxxx", user_id=bad)
                 self.assertIn("non-blank string", str(cm.exception))
 
     def test_the_zero_setup_path_and_other_clones_still_work(self):
-        for cls in (Client, AsyncClient):
+        for cls in self.CLASSES:
             self.assertEqual(cls("wos-test-xxxxxxxxxx")._user_id, "default")
             bound = cls("wos-test-xxxxxxxxxx", user_id="tenant-A")
             self.assertEqual(bound.with_model("tablet-2")._user_id, "tenant-A")
             self.assertEqual(bound.with_user("tenant-B")._user_id, "tenant-B")
+
+
+class ListEngramsKeepsUnknownFieldsTest(unittest.TestCase):
+    """A field the service adds has to reach the caller.
+
+    ``list_engrams`` rebuilt the reply into three keys, so anything else the service
+    sent was dropped on the way out — no error, no log, nothing to notice. Responses
+    widen; only the shapes this method promises are normalised.
+    """
+
+    def make(self, body):
+        srv, base = scripted_server([(200, {}, body)])
+        self.addCleanup(srv.shutdown)
+        return Client("wos-test-xxxxxxxxxx", user_id="u", base_url=base)
+
+    def test_a_field_added_later_still_arrives(self):
+        mem = self.make(
+            '{"engrams": [{"name": "deep_recall"}], "forms": [{"name": "memoir"}], '
+            '"note": null, "a_field_added_later": {"n": 7}}'
+        )
+        r = mem.list_engrams()
+        self.assertEqual(r["a_field_added_later"], {"n": 7}, "a field added later was dropped")
+        self.assertEqual(r["engrams"][0]["name"], "deep_recall")
+        self.assertIsNone(r["note"])
+
+    def test_non_objects_and_a_non_string_note_are_dropped(self):
+        # TypeScript's twin keeps objects only and a string note only.
+        mem = self.make(
+            '{"engrams": [null, "x", {"name": "deep_recall"}], "forms": [1], "note": 42}'
+        )
+        r = mem.list_engrams()
+        self.assertEqual(r["engrams"], [{"name": "deep_recall"}])
+        self.assertEqual(r["forms"], [])
+        self.assertIsNone(r["note"])
+
+
+class MalformedErrorBodyTest(unittest.TestCase):
+    """A 4xx has to arrive as a WosError however odd its body is.
+
+    `message` comes out of somebody else's JSON and is not always a string.
+    `{"message": null}` and `{"error": {"message": 42}}` both reached a `len()` that
+    only strings answer, so the function whose job is to BUILD the error raised
+    TypeError instead — outside every handler, so `except WosError` missed a plain 400.
+    """
+
+    def test_a_non_string_message_still_builds_a_wos_error(self):
+        for body in ('{"error": {"message": 42}}', '{"message": null}',
+                     '{"error": {"message": ["a", "b"]}}', '{"error": {"message": {"k": 1}}}'):
+            e = wontopos._parse_error(400, body)
+            self.assertIsInstance(e, WosError, f"body {body} did not build a WosError")
+            self.assertEqual(e.status, 400)
+            self.assertIsInstance(str(e), str)
+
+    def test_a_long_non_string_message_is_still_capped(self):
+        body = '{"error": {"message": ' + str(list(range(20000))) + '}}'
+        e = wontopos._parse_error(400, body)
+        self.assertLessEqual(len(str(e)), wontopos._MAX_ERR_MSG + 40)
 
 
 class KeyCharsetTest(unittest.TestCase):
@@ -1577,3 +1866,11 @@ class ListShapeTest(unittest.TestCase):
             self.assertEqual(got, [], path_body)
             for _ in got:  # must be iterable as the annotation promises
                 pass
+
+
+# Must stay LAST. It sat at line 947 of a 1,624-line file, so `python tests/test_client.py`
+# ran 76 of 129 tests and exited OK — the 53 defined below it never executed. publish.sh
+# uses `unittest discover`, so the release gate was never fooled; a developer running the
+# file was.
+if __name__ == "__main__":
+    unittest.main()

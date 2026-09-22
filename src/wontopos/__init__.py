@@ -35,7 +35,7 @@ it. Set a default on the client, override per call:
     mem.recall("...", user_id="alice", model="tablet-1")   # this call only
 
 Reliability: every call retries transient failures with exponential backoff +
-jitter, honoring ``Retry-After`` — 429 always; 502/503 and connection errors only
+jitter, honoring ``Retry-After`` — 429 always; 408/502/503/504 and connection errors only
 when a retry can never double-process a write (idempotent calls, or a failure at
 connect time). Tune with ``Client(retries=...)`` (0 disables) and ``timeout=``,
 or per call site via the ``with_timeout()`` / ``with_retries()`` clones.
@@ -68,7 +68,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-__version__ = "2.2.38"
+__version__ = "2.2.39"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -108,13 +108,16 @@ if os.environ.get("WONTOPOS_LOG", "").lower() == "debug":  # opt-in, like OPENAI
         _handler = logging.StreamHandler()
         _handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
         _logger.addHandler(_handler)
-# 429 = rate-limited BEFORE processing, so retrying is always safe (no write
-# landed, nothing billed). 502/503 are ambiguous for a write: the gateway may
-# have returned them AFTER the backend already processed (and billed) the
-# request, so retrying a POST could double-store / double-bill. We therefore
-# retry 502/503 only for idempotent methods.
+# 429 is refused before the request is processed, so nothing was stored and any
+# method may retry. 502/503 are ambiguous for a write — they can arrive after the
+# write already landed, and a retried POST would store it twice. Those retry only
+# for idempotent methods.
 _RETRY_ALWAYS = (429,)
-_RETRY_IF_IDEMPOTENT = (502, 503)
+# 504 carries the same ambiguity as 502/503. 408 is listed here rather than in
+# _RETRY_ALWAYS: RFC 7231 says the server never got a complete request, but an
+# intermediary can answer 408 on its own, and then it does not know what happened
+# further along either.
+_RETRY_IF_IDEMPOTENT = (408, 502, 503, 504)
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
 # Refuse to buffer absurd responses (real ones are a few KB) — protects the
@@ -133,10 +136,8 @@ _MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_PAGES = 20_000
 # What the API accepts as an ``Idempotency-Key``. Checked client-side so a bad key
 # fails before the request instead of coming back as a 400 mid-retry.
-# `fullmatch`, not `match`: in Python `$` also matches just BEFORE a trailing
-# newline, so `match()` accepted "key\n" — which then died inside http.client as
-# `ValueError: Invalid header value`, the opaque failure this check exists to
-# prevent. The TypeScript and Rust clients rejected it all along.
+# `fullmatch`, not `match`: in Python `$` also matches just before a trailing
+# newline.
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}")
 
 
@@ -165,10 +166,8 @@ _warned_store_ids: "dict" = {}
 class _Backoff(Exception):
     """Internal: leave an open streaming response before sleeping on a retry.
 
-    Not an error anyone sees. The async client used to `await asyncio.sleep(...)` inside
-    `async with client.stream(...)`, which holds a pooled connection for the whole
-    backoff; a 429 burst then parked the entire httpx pool and every other request in
-    the process failed PoolTimeout.
+    Not an error anyone sees. Sleeping inside `async with client.stream(...)` would hold
+    a pooled connection for the whole backoff.
     """
 
 
@@ -292,10 +291,6 @@ def _check_count(limit: int, name: str = "limit") -> None:
     nothing was sent, and ``WosError`` with status 0 is ``APIConnectionError`` — "the
     request never got a response". Reusing that status for a typo told a caller
     branching on ``e.status == 0`` to retry a bad argument forever.
-
-    Refusing rather than clamping is the same decision as 2.2.35's, where a Rust
-    ``limit`` of 0 had been rewritten to 10 and the caller was handed ten memories
-    they had not asked for, and the bill for them.
     """
     if not isinstance(limit, int) or isinstance(limit, bool):
         raise ValueError(f"{name} must be an int, got {type(limit).__name__}")
@@ -675,7 +670,7 @@ def _never_sent(exc: requests.exceptions.ConnectionError) -> bool:
     """True when the failure happened while ESTABLISHING the connection (DNS,
     refused, connect timeout) — the request never reached the server, so a retry
     can't double-process a write. A mid-stream drop ("Connection aborted") is
-    ambiguous: the server may already have processed (and billed) the request."""
+    ambiguous: the server may already have processed the request."""
     if isinstance(exc, requests.exceptions.ConnectTimeout):
         return True
     try:
@@ -692,6 +687,31 @@ def _never_sent(exc: requests.exceptions.ConnectionError) -> bool:
     if isinstance(reason, MaxRetryError):
         reason = reason.reason
     return isinstance(reason, connect_errs)
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """True when the body stopped arriving because time ran out, not because the
+    connection broke.
+
+    The two are not the same for a retry. A drop means nothing more is coming, so
+    replaying an idempotent read costs one extra request. A timeout means the server
+    may still be working on it — replaying adds load to a request that could yet be
+    answered, and the reply the caller finally gets is the second one.
+
+    ``stream=True`` sends a read timeout through ``iter_content``, where requests
+    reports it as ConnectionError carrying urllib3's ReadTimeoutError in ``args[0]``
+    rather than as its own ReadTimeout — so checking the requests class alone misses it.
+    """
+    if isinstance(exc, requests.exceptions.Timeout):
+        return True
+    try:
+        from urllib3.exceptions import MaxRetryError, ReadTimeoutError, TimeoutError as U3Timeout
+    except ImportError:  # pragma: no cover — urllib3 always ships with requests
+        return False
+    reason = exc.args[0] if exc.args else None
+    if isinstance(reason, MaxRetryError):
+        reason = reason.reason
+    return isinstance(reason, (ReadTimeoutError, U3Timeout))
 
 
 def _backoff(attempt: int, retry_after: Optional[str] = None) -> float:
@@ -750,8 +770,10 @@ def _parse_error(status: int, text: str) -> "WosError":
     #   Spec simple:             {"error":"reason string"}
     # Fall back to raw text. Cap the fallback so a 64MB error body (within the
     # response cap) can't become a 64MB exception string.
-    text = text if len(text) <= _MAX_ERR_MSG else text[:_MAX_ERR_MSG] + "…(truncated)"
-    msg, request_id = text, None
+    # Parse first, then cap the extracted strings: capping the raw body can cut the
+    # JSON and lose `request_id`.
+    msg = text if len(text) <= _MAX_ERR_MSG else text[:_MAX_ERR_MSG] + "…(truncated)"
+    request_id = None
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -766,6 +788,12 @@ def _parse_error(status: int, text: str) -> "WosError":
                 msg = data["message"]
     except Exception:
         pass
+    # `message` is not always a string (`{"message": null}`, `{"error": {"message": 42}}`),
+    # so coerce it before capping.
+    if not isinstance(msg, str):
+        msg = str(msg)
+    if len(msg) > _MAX_ERR_MSG:
+        msg = msg[:_MAX_ERR_MSG] + "…(truncated)"
     return _make_error(status, msg, request_id=request_id)
 
 
@@ -837,7 +865,13 @@ class RateLimitError(WosError):
 
 
 class ServerError(WosError):
-    """5xx — the service failed. Safe to retry."""
+    """5xx — the service failed.
+
+    ``502`` / ``503`` / ``504`` are transient: this client already retries them where a
+    retry cannot double-process a write. ``501`` is NOT — the engine behind the model
+    you selected does not implement that endpoint at all, so retrying can never
+    succeed. Pick a model that supports it (``list_models``) instead.
+    """
 
 
 _STATUS_ERRORS = {
@@ -939,8 +973,8 @@ class Client:
         user_id:  default store for every call. Pass ``user_id=`` on a single
                   call to override it. Defaults to the account's ``default`` store.
         retries:  how many times to retry transient failures before raising —
-                  429 always; 502/503 and connection errors only when a retry
-                  can never double-process a write. 0 disables retries.
+                  429 always; 408/502/503/504 and connection errors only when a
+                  retry can never double-process a write. 0 disables retries.
         deadline: a TOTAL budget for one call, in seconds, across every attempt.
                   ``timeout`` bounds one attempt; at the defaults (30s, two retries)
                   a call can hold for 30 + backoff + 30 + backoff + 30, over a
@@ -1141,9 +1175,9 @@ class Client:
         key arrives with a different body. Use it when the retry is yours — a job that died
         and was re-run, a queue that redelivers. The SDK retries a write on exactly one
         status: 429, which the service answers before it processes anything, so nothing was
-        stored. It never retries a write on 502 / 503 or a dropped body, where the request
-        may already have been stored and billed — without a key it cannot know whether that
-        first attempt landed.
+        stored. It never retries a write on 408 / 502 / 503 / 504 or a dropped body,
+        where the first attempt may already have landed — without a key the client
+        cannot know whether it did.
 
         Derive the key from the thing being stored (``f"import:{row.id}"``), never a
         constant: reusing one key for two different writes replays the first and the second
@@ -1191,6 +1225,7 @@ class Client:
         )
 
     store = add  # alias (back-compat / preference)
+
 
     def add_turn(
         self, user_msg: str = "", assistant_msg: str = "", user_id: Optional[str] = None, *,
@@ -1448,10 +1483,7 @@ class Client:
             print(m["content"], m["is_superseded"])
         """
         user_id, memory_id = _split_id_args(user_id, memory_id)
-        # `"   "` is truthy, so the old test passed it through as the id. The four
-        # sibling calls go through _require_memory_id, which refuses a blank one and
-        # returns it stripped; get did neither, so an id pasted from a log with a stray
-        # space was answered here and 404'd in TypeScript and Rust.
+        # A blank id is refused and a valid one is stripped, as in the sibling calls.
         if not isinstance(memory_id, str) or not memory_id.strip():
             raise ValueError(
                 "memory_id is required — the id that add/store or list_memories returned. "
@@ -1521,6 +1553,14 @@ class Client:
         """Return ALL of a store's memories as a list (the text you stored, and its
         metadata). Convenience over ``iter_memories`` for dumping a whole store."""
         return list(self.iter_memories(user_id, model=model))
+
+    def export_images(self, user_id: Optional[str] = None, *, page_size: Optional[int] = None,
+                      model: Optional[str] = None) -> list[dict]:
+        """Return ALL of a store's image memories as a list. The image-side pair of
+        ``export_memories``.
+
+        ``page_size`` sets how many arrive per request, not how many you get back."""
+        return list(self.iter_images(user_id, page_size=page_size, model=model))
 
     # ----- images (Tablet 2 and newer) -----
 
@@ -1598,10 +1638,8 @@ class Client:
         """Iterate every image memory, paging under the hood."""
         before: Optional[str] = None
         skip: Optional[list] = None
-        # A server that keeps handing back the same cursor would otherwise replay the
-        # same page up to _MAX_PAGES times, yielding duplicates and billing for every
-        # request. ``iter_memories`` has guarded this from the start; the image walk
-        # never got it, in either client. TypeScript and Rust key on the same pair.
+        # Stop when the server hands back a cursor already seen, instead of replaying
+        # the same page up to _MAX_PAGES times.
         seen: set = set()
         for _ in range(_MAX_PAGES):
             page = self.list_images(user_id, limit=page_size, before=before,
@@ -1775,11 +1813,14 @@ class Client:
         explains an empty ``engrams`` on a model without engram support.
         """
         r = self._request("GET", "/api/v1/engram")
-        return {
-            "engrams": _as_list(r.get("engrams")),
-            "forms": _as_list(r.get("forms")),
-            "note": r.get("note"),
-        }
+        # Start from the reply so fields this version does not name still reach the
+        # caller; only the promised shapes are normalised.
+        out = dict(r) if isinstance(r, dict) else {}
+        out["engrams"] = _as_records(r.get("engrams") if isinstance(r, dict) else None)
+        out["forms"] = _as_records(r.get("forms") if isinstance(r, dict) else None)
+        note = r.get("note") if isinstance(r, dict) else None
+        out["note"] = note if isinstance(note, str) else None
+        return out
 
     # ----- stores -----
 
@@ -1845,13 +1886,9 @@ class Client:
         Errors still arrive as JSON, so a non-2xx is handed to the usual ``_parse_error``
         and keeps ``NotFoundError`` / ``AuthenticationError`` behaving as everywhere else.
 
-        Retries 429 and connect-level failures, like every other call. This said "no
-        retries — the body can be megabytes and a blind retry would pay for it twice",
-        which is true of a retry AFTER bytes have arrived and not of these two: a 429
-        carries no image, and a connect failure never reached the server. So the
-        largest and most rate-limit-prone call in the SDK was the only one that gave up
-        on the first 429, while the module docstring promised the opposite. A read
-        timeout is still final — that one is ambiguous.
+        Retries 429 and connect-level failures, like every other call: a 429 carries no
+        image, and a connect failure never reached the server. A read timeout is final,
+        because the server may still be working on it.
         """
         eff_model = _check_model(model) if model else self._model
         headers = {"X-WOS-Model": eff_model} if eff_model else None
@@ -1890,10 +1927,7 @@ class Client:
             # The JSON path has always had this `finally`.
             closed = False
             try:
-                # The quota this call just spent. rate_limit promises the MOST RECENT
-                # call; the async client and Rust record it here and this one did not, so
-                # a sync image loop self-throttling on it read a snapshot frozen at
-                # whatever JSON call came before — or None.
+                # `rate_limit` reports the most recent call, image calls included.
                 self._rate_limit = _parse_rate_limit(r.headers) or self._rate_limit
                 if 300 <= r.status_code < 400:
                     raise _make_error(
@@ -1908,8 +1942,21 @@ class Client:
                 if r.status_code >= 400:
                     # Capped like every other error body: the response is streamed now,
                     # so ``r.text`` would buffer whatever a broken host sends.
-                    raise _parse_error(r.status_code, Client._read_capped(r))
-                data = Client._read_capped_bytes(r)
+                    #
+                    # On an error response the body is only the message: if reading it
+                    # fails, report the status.
+                    try:
+                        body = Client._read_capped(r)
+                    except Exception:
+                        body = ""
+                    raise _parse_error(r.status_code, body)
+                try:
+                    data = Client._read_capped_bytes(r)
+                except WosError:
+                    raise  # the size cap — already the right error
+                except Exception as e:
+                    # A body that stops arriving is a transport failure.
+                    raise APIConnectionError(0, f"network error: {e}") from e
             finally:
                 if not closed:
                     r.close()
@@ -2009,7 +2056,7 @@ class Client:
                 # Retry only when it cannot double-process a write: idempotent
                 # methods always; writes only when the failure was at CONNECT
                 # time (the request never reached the server). A mid-stream drop
-                # on a POST is ambiguous — the write may have landed and billed.
+                # on a POST is ambiguous — the write may already have landed.
                 safe = method.upper() in _IDEMPOTENT_METHODS or _never_sent(e)
                 if safe and attempt + 1 < attempts:
                     delay = _backoff(attempt)
@@ -2052,9 +2099,29 @@ class Client:
                 except WosError:
                     raise  # the size cap — already the right error
                 except Exception as e:
-                    # A drop while READING the body is a transport failure — surface
-                    # it as APIConnectionError, not a raw urllib3 internal. Ambiguous
-                    # (the response existed), so never retried.
+                    # A drop while READING the body is a transport failure — surface it
+                    # as APIConnectionError, not a raw urllib3 internal.
+                    #
+                    # Retried on an idempotent method, like every other connection
+                    # failure. `stream=True` means the body never passes through the
+                    # ConnectionError handler around session.request(), which covers
+                    # only the connect/header phase, so this path needs its own retry.
+                    # A replayed GET cannot double-process anything; a write still
+                    # cannot retry, because the first attempt may already have landed.
+                    #
+                    # A timeout is not a drop and is excluded — see `_timed_out`.
+                    if (
+                        method.upper() in _IDEMPOTENT_METHODS
+                        and not _timed_out(e)
+                        and attempt + 1 < attempts
+                    ):
+                        delay = _backoff(attempt, None)
+                        _logger.debug(
+                            "%s %s — body dropped mid-stream, retrying in %.1fs (attempt %d/%d)",
+                            method, path, delay, attempt + 1, attempts,
+                        )
+                        time.sleep(_sleep_within(delay, deadline_at, self._deadline))
+                        continue
                     raise APIConnectionError(0, f"network error: {e}") from e
             finally:
                 r.close()
@@ -2129,7 +2196,7 @@ class AsyncClient:
             hits = await mem.search("what does alice drink?")
 
     Same reliability and security posture as the sync client: retries with
-    backoff (429/502/503 + connect errors, ``Retry-After`` honored), redirects
+    backoff (429/408/502/503/504 + connect errors, ``Retry-After`` honored), redirects
     refused, TLS 1.2 floor, 64MB response cap, key masked in ``repr``.
     Close it with ``await mem.aclose()`` or use ``async with``.
     """
@@ -2149,12 +2216,7 @@ class AsyncClient:
         deadline: Optional[float] = None,
         _http: Any = None,
     ):
-        # Same alias as the sync client, and now the same resolution. This used to be
-        # ``retries: int = 2`` compared against 2, which cannot tell "the caller said 2"
-        # from "the caller said nothing" — so ``AsyncClient(key, retries=2,
-        # max_retries=5)`` retried five times against an explicit instruction to retry
-        # twice. The sync client's comment explained exactly that, and this comment
-        # pointed at it while keeping the bug.
+        # Same alias as the sync client: an explicit ``retries`` wins over ``max_retries``.
         if retries is None:
             retries = 2 if max_retries is None else max_retries
         try:
@@ -2301,6 +2363,7 @@ class AsyncClient:
 
     store = add  # alias (back-compat / preference)
 
+
     async def add_turn(
         self, user_msg: str = "", assistant_msg: str = "", user_id: Optional[str] = None, *,
         model: Optional[str] = None, idempotency_key: Optional[str] = None,
@@ -2420,10 +2483,7 @@ class AsyncClient:
         Same visibility as ``list_memories``; unknown, foreign, or internal-only ids
         raise ``NotFoundError``."""
         user_id, memory_id = _split_id_args(user_id, memory_id)
-        # `"   "` is truthy, so the old test passed it through as the id. The four
-        # sibling calls go through _require_memory_id, which refuses a blank one and
-        # returns it stripped; get did neither, so an id pasted from a log with a stray
-        # space was answered here and 404'd in TypeScript and Rust.
+        # A blank id is refused and a valid one is stripped, as in the sibling calls.
         if not isinstance(memory_id, str) or not memory_id.strip():
             raise ValueError(
                 "memory_id is required — the id that add/store or list_memories returned. "
@@ -2475,6 +2535,11 @@ class AsyncClient:
     async def export_memories(self, user_id: Optional[str] = None, *, model: Optional[str] = None) -> list[dict]:
         """Return ALL of a store's memories as a list (the text you stored, and its metadata)."""
         return [m async for m in self.iter_memories(user_id, model=model)]
+
+    async def export_images(self, user_id: Optional[str] = None, *, page_size: Optional[int] = None,
+                            model: Optional[str] = None) -> list[dict]:
+        """Return ALL of a store's image memories as a list."""
+        return [m async for m in self.iter_images(user_id, page_size=page_size, model=model)]
 
     # ----- images (Tablet 2 and newer) -----
 
@@ -2548,10 +2613,8 @@ class AsyncClient:
         """Async-yield every image memory, paging under the hood."""
         before: Optional[str] = None
         skip: Optional[list] = None
-        # A server that keeps handing back the same cursor would otherwise replay the
-        # same page up to _MAX_PAGES times, yielding duplicates and billing for every
-        # request. ``iter_memories`` has guarded this from the start; the image walk
-        # never got it, in either client. TypeScript and Rust key on the same pair.
+        # Stop when the server hands back a cursor already seen, instead of replaying
+        # the same page up to _MAX_PAGES times.
         seen: set = set()
         for _ in range(_MAX_PAGES):
             page = await self.list_images(user_id, limit=page_size, before=before,
@@ -2652,11 +2715,14 @@ class AsyncClient:
     async def list_engrams(self) -> dict:
         """The engrams + delivery forms the selected model can run (see sync client)."""
         r = await self._request("GET", "/api/v1/engram")
-        return {
-            "engrams": _as_list(r.get("engrams")),
-            "forms": _as_list(r.get("forms")),
-            "note": r.get("note"),
-        }
+        # Start from the reply so fields this version does not name still reach the
+        # caller; only the promised shapes are normalised.
+        out = dict(r) if isinstance(r, dict) else {}
+        out["engrams"] = _as_records(r.get("engrams") if isinstance(r, dict) else None)
+        out["forms"] = _as_records(r.get("forms") if isinstance(r, dict) else None)
+        note = r.get("note") if isinstance(r, dict) else None
+        out["note"] = note if isinstance(note, str) else None
+        return out
 
     async def list_models(self) -> list[dict]:
         """Available models. Needs no API key."""
@@ -2736,13 +2802,7 @@ class AsyncClient:
     async def _request_bytes(self, path: str, body: dict, *, model: Optional[str] = None) -> tuple[bytes, str]:
         """One request that answers with BYTES rather than JSON — see ``Client._request_bytes``.
 
-        Retries 429 and connect-level failures, like every other call. The old note here
-        said "no retries — the body can be megabytes and a blind retry would pay for it
-        twice", which is true of a retry AFTER bytes have arrived and not of these two: a
-        429 carries no image, and a connect failure never reached the server. The sync
-        client and the TypeScript client both corrected this; this one had not, so
-        ``async for m in mem.iter_images(): await mem.get_image(...)`` — the most
-        rate-limit-prone loop in the SDK — died on the first 429 the others rode through.
+        Retries 429 and connect-level failures, like every other call.
         """
         eff_model = _check_model(model) if model else self._model
         headers = {"X-WOS-Model": eff_model} if eff_model else None
@@ -2759,7 +2819,8 @@ class AsyncClient:
                 )
             except APIConnectionError as e:
                 # Only a failure that never reached the server. A read timeout is
-                # ambiguous and a mid-stream drop may already have been billed.
+                # ambiguous, and after a mid-stream drop the write may already
+                # have landed.
                 if attempt + 1 >= attempts or not getattr(e, "_never_sent", False):
                     raise
                 await asyncio.sleep(_sleep_within(_backoff(attempt), deadline_at, self._deadline))
@@ -2798,7 +2859,18 @@ class AsyncClient:
                 raise _make_error(
                     r.status_code, "the API answered with a redirect; refusing to follow it"
                 )
-            data = await self._read_capped_bytes(r)
+            try:
+                data = await self._read_capped_bytes(r)
+            except Exception as e:
+                if r.status_code >= 400:
+                    # On an error response the body is only the message: if reading it
+                    # fails, report the status.
+                    data = b""
+                elif isinstance(e, WosError):
+                    raise  # the size cap on a body we asked for — already right
+                else:
+                    # A body that stops arriving is a transport failure.
+                    raise APIConnectionError(0, f"network error: {e}") from e
             if r.status_code >= 400:
                 err = _parse_error(r.status_code, data.decode("utf-8", "replace"))
                 # Carried on the exception, not on the client. Two awaits sit between
@@ -2924,16 +2996,10 @@ class AsyncClient:
                 raise APIConnectionError(0, f"network error: {e}") from e
             except (self._httpx.ReadError, self._httpx.WriteError, self._httpx.RemoteProtocolError) as e:
                 # The connection dropped MID-STREAM: the server may already have
-                # processed (and billed) the request, so a write must not be
-                # retried. An idempotent method can be — replaying a GET or a
-                # DELETE cannot double-process anything.
-                #
-                # The sync client has always retried these for idempotent methods
-                # (`method in _IDEMPOTENT_METHODS or _never_sent(e)`); this client
-                # caught only connect-level failures, so the same dropped GET was
-                # retried by one and raised by the other. Two clients published as
-                # "the same surface" should not disagree about that. Timeouts stay
-                # out of it in both: those are ambiguous, not merely idempotent.
+                # processed the request, so a write must not be retried. An
+                # idempotent method can be — replaying a GET or a
+                # DELETE cannot double-process anything. A timeout is not a drop and
+                # stays out of it — see `_timed_out`.
                 if method.upper() in _IDEMPOTENT_METHODS and attempt + 1 < attempts:
                     delay = _backoff(attempt)
                     _logger.debug(
