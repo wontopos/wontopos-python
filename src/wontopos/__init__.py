@@ -63,12 +63,13 @@ import ssl
 import sys
 import time
 import warnings
+import weakref
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import requests
 
-__version__ = "2.2.39"
+__version__ = "2.2.40"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -144,19 +145,21 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}")
 
 # ── The boundaries that go wrong quietly, said out loud ─────────────────────
 
+#: The store ids the API accepts.
+_STORE_ID_FORMAT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
 def _normalize_store_id(sid: str) -> str:
-    """The transformation the API actually applies to a store id."""
+    """The normalized form the API derives from a store id: lowercased, anything outside
+    ``[a-z0-9_]`` as ``_``."""
     return re.sub(r"[^a-z0-9_]", "_", sid.lower())
 
 
 # Ids already warned about, so each one is reported once. A dict is used as an
 # ORDERED set (insertion order) purely so the oldest entry can be evicted.
 #
-# This has to be bounded. The warning below fires on ids that fold, and the shape
-# it exists to catch is an email — which the SDK's own documented pattern ("one
-# store per end user") means one entry per user, held for the life of the process.
-# The cap keeps that bounded. Nothing is lost by it: the set exists so a developer
-# is told once, and past a few hundred distinct ids that message has landed.
+# Bounded: with one store per end user it sees one id per user, and past a few
+# hundred distinct ids the warning has been read.
 _WARNED_STORE_IDS_MAX = 1024
 #: One lock for both process-global warn caches — see _warn_if_store_id_collapses.
 _warn_lock = threading.Lock()
@@ -189,21 +192,18 @@ def _assert_usable_store_id(user_id: Any) -> None:
 
 
 def _warn_if_store_id_collapses(sid: str) -> None:
-    """The API lowercases a store id and rewrites anything outside ``[a-z0-9_]`` to ``_``,
-    so ``Alice.Smith`` · ``alice-smith`` · ``alice_smith`` are **the same store**.
-
-    The common way to use this SDK is one store per end user, which makes that a data
-    exposure: ``bob.lee@x.com`` and ``bob-lee@x.com`` share every memory between them and
-    nothing in the response says so (the notice only appears when ``create_store``
-    actually creates one, and an app reaching for a store that already exists never gets
-    to see it).
-
-    Refusing is not an option — the API accepts these ids and code may already depend on
-    them. So say it plainly, once, at the moment it happens."""
+    """A store id is 1-64 ASCII letters, digits, ``.``, ``_`` and ``-``, starting with a
+    letter or digit. Creating any other id (an email address, a name in another script) is
+    refused (400), so key stores on an id of your own. Store ids compare without regard to
+    case: ``Alice`` and ``alice`` name one store. Ids that differ only in ``.``, ``_`` or
+    ``-`` cannot both exist: once ``alice-smith`` exists, creating ``alice.smith`` is
+    refused (409) and using it answers 404. With one store per end user, derive the ids so
+    two users never differ only in those three characters."""
     if not sid:
         return
+    valid = _STORE_ID_FORMAT.match(sid) is not None
     normalized = _normalize_store_id(sid)
-    if normalized == sid:
+    if valid and normalized == sid:
         return
     # Under a lock. The set is process-global and every request touches it, so a
     # threaded app can run membership, insert, iterate and evict at the same time.
@@ -219,11 +219,18 @@ def _warn_if_store_id_collapses(sid: str) -> None:
         # first appears late still gets its one warning.
         while len(_warned_store_ids) > _WARNED_STORE_IDS_MAX:
             _warned_store_ids.pop(next(iter(_warned_store_ids)))
+    if not valid:
+        logging.getLogger("wontopos").warning(
+            "store id %r is not a valid store id: use 1-64 ASCII letters, digits, '.', '_' and "
+            "'-', starting with a letter or digit. Creating it is refused (400).",
+            sid,
+        )
+        return
     logging.getLogger("wontopos").warning(
-        "store id %r is stored as %r (lowercased, and anything outside [a-z0-9_] becomes '_'). "
-        "Ids that differ only by case or punctuation share ONE store and therefore one set of "
-        "memories — if these ids come from your end users, normalize them yourself first so two "
-        "people can never collide.",
+        "store id %r normalizes to %r. Ids that differ only by case name this same store; one "
+        "that differs only by punctuation cannot be created beside it (409) and is not found "
+        "when used (404). If these ids come from your end users, normalize them yourself first "
+        "so two people never compete for one name.",
         sid, normalized,
     )
 
@@ -337,8 +344,26 @@ def _recall_body(store_id: str, query: str, form: Optional[str], tz: Optional[in
 
 
 _KNOWN_SEARCH_KEYS = frozenset(
-    {"cache_control", "speaker", "filters", "verify", "max_images", "extra"}
+    {"cache_control", "speaker", "filters", "verify", "max_images", "form", "tz", "extra"}
 )
+# Keys that name a store or a request setting. Given to ``add`` as metadata they would
+# be stored as a field while the write went to the default store.
+_NOT_METADATA = frozenset({"userid", "storeid", "idempotencykey"})
+
+
+def _names_a_store(key: Any) -> bool:
+    return isinstance(key, str) and re.sub(r"[\s_.\-]", "", key.lower()) in _NOT_METADATA
+
+
+def _metadata(metadata: Optional[dict], extra: dict) -> dict:
+    md = {**metadata, **extra} if metadata else extra
+    bad = sorted(k for k in md if _names_a_store(k))
+    if bad:
+        raise ValueError(
+            f"{bad[0]!r} is not a metadata field: pass the store as user_id= and an "
+            "idempotency key as idempotency_key=. Nothing was sent."
+        )
+    return md
 # Named arguments of the call. Reaching the body through ``opts`` would let forwarded
 # input choose someone else's store.
 _RESERVED_SEARCH_KEYS = frozenset({"user_id", "query", "max_results"})
@@ -369,9 +394,7 @@ def _check_search_opts(opts: dict) -> None:
     for k in opts:
         if k in _RESERVED_SEARCH_KEYS:
             raise ValueError(
-                f"{k!r} is set by the call, not by options — pass it as an argument. "
-                "An app forwarding untrusted input as options cannot steer the store, "
-                "the query or the count, and this says so rather than dropping it silently."
+                f"{k!r} is set by the call, not by options — pass it as an argument."
             )
         if k in _KNOWN_SEARCH_KEYS:
             continue
@@ -395,10 +418,8 @@ def _search_body(store_id: str, query: str, limit: int, opts: dict,
     merge four times is how a guard ends up living in three of them — the exact shape
     of bug this SDK has shipped before. One function, four callers.
 
-    Reserved fields win over ``opts``: an app forwarding untrusted input as ``opts``
-    must not be able to override the store, the query, or the limit. ``verify`` and
-    ``max_images`` are set last for the same reason — a stray copy inside ``opts``
-    cannot beat the named argument the caller actually wrote.
+    The store, the query and the count win over anything in ``extra``, and ``verify``
+    and ``max_images`` over a stray copy in ``opts``.
     """
     _check_search_opts(opts)
     _warn_on_unknown_filters(opts.get("filters"))
@@ -528,6 +549,14 @@ def _as_dict(x: Any) -> dict:
     return x if isinstance(x, dict) else {}
 
 
+def _memory_from_get(r: Any) -> dict:
+    """``get`` answers ``{"memory": {...}}`` on some models and the row itself on others."""
+    r = _as_dict(r)
+    if isinstance(r.get("memory"), dict):
+        return r["memory"]
+    return r if isinstance(r.get("id"), str) else {}
+
+
 def _as_records(x: Any) -> list:
     """A list of API records (memories, turns, models...) — every element is an
     object by contract. `_as_list` only fixes the CONTAINER: a hostile/broken
@@ -556,26 +585,21 @@ def _split_id_args(user_id: Optional[str], memory_id: str) -> tuple[Optional[str
 
 
 def _merge_results(resp: Any) -> list:
-    """Every memory a search returned, from both fields, as one list.
-
-    Some models answer with the assistant's own words in `self_memories`, not
-    repeated in `memories`. `search()` used to return `memories` alone, so an
-    assistant turn stored with `add_turn` was missing from its results on those
-    models while the same query returned it on others — upgrading made search
-    return LESS, and what went missing had already been retrieved and paid for.
-
-    Both fields are returned here, de-duplicated by id, each memory carrying its
-    `speaker` so a caller can still tell who said what. Callers who want them
-    kept apart use `search_self()`, which is what that method is for.
-    """
+    """Every memory a search returned — ``memories``, then ``self_memories``, then
+    ``images`` — as one list, de-duplicated by id. Each keeps its ``speaker`` and, for
+    a photo, its ``image_ref``, so a caller can still tell them apart."""
     if not isinstance(resp, dict):
         return []
-    main = _as_records(resp.get("memories"))
-    mine = _as_records(resp.get("self_memories"))
-    if not mine:
-        return main
-    seen = {m["id"] for m in main if isinstance(m.get("id"), str)}
-    return main + [m for m in mine if not (isinstance(m.get("id"), str) and m["id"] in seen)]
+    out = _as_records(resp.get("memories"))
+    seen = {m["id"] for m in out if isinstance(m.get("id"), str)}
+    for m in _as_records(resp.get("self_memories")) + _as_records(resp.get("images")):
+        mid = m.get("id")
+        if isinstance(mid, str):
+            if mid in seen:
+                continue
+            seen.add(mid)
+        out.append(m)
+    return out
 
 
 def _form_body(body: dict, form: Optional[str], tz: Optional[int]) -> dict:
@@ -648,6 +672,27 @@ class _TLSAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, *args: Any, **kwargs: Any):
         kwargs["ssl_context"] = _tls_context()
         return super().init_poolmanager(*args, **kwargs)
+
+
+# A forked child inherits the parent's open connections. Two processes reading one
+# socket get each other's responses, so the child drops every pooled connection.
+_sessions: "weakref.WeakSet[requests.Session]" = weakref.WeakSet()
+
+
+def _drop_pools_after_fork() -> None:
+    for sess in list(_sessions):
+        for adapter in sess.adapters.values():
+            managers = [getattr(adapter, "poolmanager", None)]
+            managers += list(getattr(adapter, "proxy_manager", {}).values())
+            for pm in managers:
+                try:
+                    pm.clear()
+                except Exception:
+                    pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_pools_after_fork)
 
 
 def _warn_if_plain_http(base: str) -> None:
@@ -853,11 +898,12 @@ class PermissionDeniedError(WosError):
 
 
 class NotFoundError(WosError):
-    """404 — the store or resource doesn't exist (create the store first)."""
+    """404 — the store or resource doesn't exist."""
 
 
 class ConflictError(WosError):
-    """409 — a concurrent write to the same store. Retry."""
+    """409 — another write to this store was in flight (nothing was stored; retry), or the
+    store id collides with an existing store's (permanent)."""
 
 
 class RateLimitError(WosError):
@@ -1045,6 +1091,7 @@ class Client:
                 "Content-Type": "application/json",
                 "User-Agent": _USER_AGENT,
             })
+        _sessions.add(self._session)
         _warn_if_plain_http(self._base)
 
     @classmethod
@@ -1170,6 +1217,11 @@ class Client:
 
         ``user_id`` is optional — omit it to use the client's default store.
 
+        Do not splat input you did not write (``**request_json``): ``user_id`` and
+        ``model`` bind to the named parameters, so the dict would choose them. Forward
+        it as ``metadata=``. A key that names a store (``userId``, ``store_id``, ...) is
+        refused rather than stored as metadata.
+
         ``idempotency_key`` makes repeating THIS EXACT write safe: the API replays the
         first response instead of storing again (10 minutes), and answers 422 if the same
         key arrives with a different body. Use it when the retry is yours — a job that died
@@ -1206,6 +1258,8 @@ class Client:
         (RFC3339, usually from EXIF; it fills ``event_date`` when that is empty, so the
         memory sorts by when the image was TAKEN rather than when it was uploaded).
 
+        Both edges must be 700px or more; a smaller image is refused (400).
+
         What we keep is NOT your original. Over 1568px on the long edge the picture is
         downscaled to 1568 on the way in, and downscaling means re-encoding: lossless
         formats are written as WebP, so a PNG comes back from ``get_image`` as
@@ -1213,7 +1267,7 @@ class Client:
         memory engine, not a photo host — put the full-resolution file somewhere of your
         own and its URL in ``reference``.
         """
-        md = {**metadata, **extra} if metadata else extra
+        md = _metadata(metadata, extra)
         body: dict = {"user_id": self._uid(user_id), "content": content, "metadata": md}
         if image is not None:
             body["image"] = _normalize_image(image)
@@ -1293,17 +1347,20 @@ class Client:
 
         ``user_id`` is optional — omit it to use the client's default store.
 
+        Do not splat input you did not write (``**request_json``): ``user_id``, ``limit``
+        and ``model`` bind to the named parameters, so the dict would choose them.
+        Forward it as ``extra=``, where the store, query and count always win.
+
         ``limit`` is 5-20, and out of range is refused rather than clamped: asking for
         50 and silently receiving 20 reads as "that is all there is". The default is 10,
         so a call that passes no count is unaffected. Before 2.2.35 the count was sent
         on unchecked.
 
-        ``limit`` bounds ``memories``, not the returned list. On a model that keeps
-        the assistant's own words separate (Scroll 1.2+) those come back as well, so
-        the list can hold more than ``limit``. They were retrieved and billed either
-        way; dropping them would only hide what you already paid for. Size a prompt
-        window on the list you get back, not on ``limit``. :meth:`search_self` hands
-        the two back apart.
+        ``limit`` bounds ``memories``, not the returned list. The assistant's own words
+        (Scroll 1.2+) and image memories (Tablet 2+, one unless ``max_images`` says
+        otherwise) come back in it as well, so it can hold more than ``limit``. They
+        are billed either way. Size a prompt window on the list you get back, not on
+        ``limit``. :meth:`search_full` hands the fields back apart.
 
         ``filters`` chooses what is searched, not what is kept afterwards — a narrow
         filter still returns your full ``limit`` when that many matches sit inside it::
@@ -1370,8 +1427,6 @@ class Client:
         verification ran. It now raises ``ValueError`` and names the key you probably
         meant. Pass a genuinely new option under ``extra``.
         """
-        # Reserved fields win over **opts: an app that forwards untrusted input as
-        # opts must not be able to override the store (user_id), query, or limit.
         body = _search_body(self._uid(user_id), query, limit, opts, verify, max_images)
         r = self._post("/api/v1/memory/search", body, model=model)
         return _merge_results(r)
@@ -1387,7 +1442,7 @@ class Client:
         merged list an incomplete answer::
 
             r = mem.search_full("the day we moved", "alice", max_images=3, verify=2)
-            r["images"]        # the photos, which search() drops
+            r["images"]        # the photos, apart from the text memories
             r["verify_used"]   # re-ask passes that actually ran (you are billed per pass)
 
         ``memories``, ``self_memories`` and ``images`` are always lists. Anything else
@@ -1407,11 +1462,12 @@ class Client:
     ) -> dict:
         """Search a self-memory model (Scroll 1.2+): both fields from ONE call.
 
-        Returns ``{"memories": [...], "self_memories": [...]}``. ``memories`` is what
-        others said and general memories; ``self_memories`` is the assistant's OWN
-        words (stored with ``speaker="me"``), kept apart so whoever reads them never
-        confuses who said what — never mixed into ``memories``. On a model that does
-        not keep them apart (e.g. tablet-1) ``self_memories`` is ``[]``.
+        Returns ``{"memories": [...], "self_memories": [...]}``.
+        ``memories`` is what others said and general memories; ``self_memories`` is the
+        assistant's OWN words (stored with ``speaker="me"``), kept apart so whoever
+        reads them never confuses who said what — never mixed into ``memories``. On a
+        model that does not keep them apart (e.g. tablet-1) ``self_memories`` is ``[]``.
+        Image memories are not included; :meth:`search` and :meth:`search_full` carry them.
         ``user_id`` is optional — omit it to use the client's default store.
 
             r = mem.with_model("scroll-1.2").search_self("what did I promise Alice?")
@@ -1421,7 +1477,10 @@ class Client:
         body = _search_body(self._uid(user_id), query, limit, opts, verify, max_images)
         r = self._post("/api/v1/memory/search", body, model=model)
         # `or []` on each field: a broken proxy sending null for either yields [], not None.
-        return {"memories": _as_records(r.get("memories")), "self_memories": _as_records(r.get("self_memories"))}
+        return {
+            "memories": _as_records(r.get("memories")),
+            "self_memories": _as_records(r.get("self_memories")),
+        }
 
     def recall(
         self, query: str, user_id: Optional[str] = None, *, model: Optional[str] = None,
@@ -1494,7 +1553,7 @@ class Client:
         r = self._post(
             "/api/v1/memory/get", {"user_id": self._uid(user_id), "memory_id": memory_id}, model=model
         )
-        return _as_dict(r.get("memory"))
+        return _memory_from_get(r)
 
     def list_memories(
         self, user_id: Optional[str] = None, *, limit: int = 100, cursor: Optional[str] = None, model: Optional[str] = None
@@ -1764,9 +1823,8 @@ class Client:
         ``speaker`` is the tag written at store time — ``"me"`` for the assistant's own
         words, otherwise a person's name. Same cursor paging as ``list_images``.
 
-        ``chunks`` / ``points_to_delete`` report how many underlying records a delete would
-        actually remove — usually larger than
-        ``returned``, and worth showing before anyone confirms one.
+        ``points_to_delete`` is the count to show before anyone confirms a delete of this
+        speaker's memories.
         """
         if not isinstance(speaker, str) or not speaker.strip():
             raise ValueError('speaker is required — "me" for the assistant, or a person\'s name')
@@ -1836,21 +1894,22 @@ class Client:
             mem.create_store()              # creates "alice"
             mem.add("she prefers tea")      # no user_id needed
 
-        Returns ``{"user_id", "status"}`` where ``status`` is ``"created"`` or ``"exists"``.
+        Returns ``{"user_id", "status"}`` where ``status`` is ``"created"`` or ``"exists"``,
+        plus ``canonical_id`` and ``note`` when the id is filed under a normalized form.
         """
         return self._post("/api/v1/memory/collection", {"user_id": self._uid(user_id)})
 
     def list_stores(self) -> list[dict]:
-        """List your stores: ``[{"user_id", "created_at"}, ...]`` (``default`` first)."""
+        """List your stores: ``[{"user_id", "created_at", "canonical_id"?}, ...]``
+        (``default`` first). Each ``user_id`` is the id the store was created with;
+        ``canonical_id`` appears when the normalized form differs."""
         return _as_list(self._request("GET", "/api/v1/memory/collections").get("collections"))
 
     def delete_store(self, user_id: str) -> dict:
         """Delete a store and ALL its memories. Returns ``{"user_id", "status"}``."""
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("user_id is required (a non-blank string) — delete_store never falls back to the default store.")
-        # Destructive calls bypass _uid(), so the collision warning has to be repeated
-        # here. delete_all already did; this one did not, and it is the call that drops
-        # a whole store: Alice.Smith and alice_smith are ONE store.
+        # Destructive calls bypass _uid(), so they warn here.
         _warn_if_store_id_collapses(user_id)
         return self._request("DELETE", "/api/v1/memory/collection", json_body={"user_id": user_id})
 
@@ -1997,8 +2056,7 @@ class Client:
         purpose — this is destructive, so it never falls back to the default store."""
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("user_id is required (a non-blank string) for delete_all — anything else would wipe the default store.")
-        # Destructive calls bypass _uid(), so the collision warning never fired on the
-        # two that erase data. Alice.Smith and alice_smith are ONE store.
+        # Destructive calls bypass _uid(), so they warn here.
         _warn_if_store_id_collapses(user_id)
         return self._post("/api/v1/memory/forget", {"user_id": user_id}, model=model)
 
@@ -2195,6 +2253,9 @@ class AsyncClient:
             await mem.add("she prefers tea over coffee")
             hits = await mem.search("what does alice drink?")
 
+    Create it inside the process that uses it. Unlike :class:`Client`, an
+    ``AsyncClient`` made before ``fork()`` keeps its open connections in the child.
+
     Same reliability and security posture as the sync client: retries with
     backoff (429/408/502/503/504 + connect errors, ``Retry-After`` honored), redirects
     refused, TLS 1.2 floor, 64MB response cap, key masked in ``repr``.
@@ -2350,7 +2411,7 @@ class AsyncClient:
         ``image={"data": <base64>}`` attaches an image (Tablet 2 and newer); ``content``
         may be empty, in which case the image is the memory. See ``Client.add``.
         """
-        md = {**metadata, **extra} if metadata else extra
+        md = _metadata(metadata, extra)
         body: dict = {"user_id": self._uid(user_id), "content": content, "metadata": md}
         if image is not None:
             body["image"] = _normalize_image(image)
@@ -2449,7 +2510,10 @@ class AsyncClient:
         """
         body = _search_body(self._uid(user_id), query, limit, opts, verify, max_images)
         r = await self._post("/api/v1/memory/search", body, model=model)
-        return {"memories": _as_records(r.get("memories")), "self_memories": _as_records(r.get("self_memories"))}
+        return {
+            "memories": _as_records(r.get("memories")),
+            "self_memories": _as_records(r.get("self_memories")),
+        }
 
     async def recall(
         self, query: str, user_id: Optional[str] = None, *, model: Optional[str] = None,
@@ -2494,7 +2558,7 @@ class AsyncClient:
         r = await self._post(
             "/api/v1/memory/get", {"user_id": self._uid(user_id), "memory_id": memory_id}, model=model
         )
-        return _as_dict(r.get("memory"))
+        return _memory_from_get(r)
 
     async def list_memories(
         self, user_id: Optional[str] = None, *, limit: int = 100, cursor: Optional[str] = None, model: Optional[str] = None
@@ -2729,7 +2793,8 @@ class AsyncClient:
         return _as_list((await self._request("GET", "/api/v1/models")).get("models"))
 
     async def create_store(self, user_id: Optional[str] = None) -> dict:
-        """Create a store (explicit, idempotent). Returns ``{"user_id", "status"}``."""
+        """Create a store (explicit, idempotent). Returns ``{"user_id", "status"}``, plus
+        ``canonical_id`` and ``note`` when the id is filed under a normalized form."""
         return await self._post("/api/v1/memory/collection", {"user_id": self._uid(user_id)})
 
     async def list_stores(self) -> list[dict]:
@@ -2787,8 +2852,7 @@ class AsyncClient:
         """Delete ALL memories for a store (GDPR erase). ``user_id`` required on purpose."""
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("user_id is required (a non-blank string) for delete_all — anything else would wipe the default store.")
-        # Destructive calls bypass _uid(), so the collision warning never fired on the
-        # two that erase data. Alice.Smith and alice_smith are ONE store.
+        # Destructive calls bypass _uid(), so they warn here.
         _warn_if_store_id_collapses(user_id)
         return await self._post("/api/v1/memory/forget", {"user_id": user_id}, model=model)
 

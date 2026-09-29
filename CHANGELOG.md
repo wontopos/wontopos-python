@@ -6,6 +6,39 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.40 — 2026-09-28
+
+**`get` returns the memory on the default model.** Tablet 2 answers with the memory
+itself rather than `{memory: …}`, and every client returned `{}`. All three now take
+either shape.
+
+**`search` returns the image rows the answer carried**, after the text memories and
+de-duplicated by id. They were billed and dropped. `search_full` / `searchFull` keeps
+the fields apart; `search_self` / `searchSelf` is unchanged.
+
+**Search takes `form` and `tz` again** in TypeScript and Python. 2.2.38 and 2.2.39
+refused them.
+
+**`add` refuses a metadata key that spells a store id or the idempotency key**
+(`userId`, `store_id`, `idempotencyKey`, in any case, with `_`, `-` or `.` anywhere)
+before sending, in all three clients; in Python that covers `metadata=` and extra
+keyword arguments alike. The store and the idempotency key have their own parameters.
+
+**Python: `fork()` is safe for `Client`.** A forked child drops the pooled connections
+it inherited, including proxy pools, so two processes no longer read each other's
+responses. Create an `AsyncClient` in the process that uses it.
+
+**Store ids:** the docs and the runtime warning now describe what the service has done
+since 2026-09-23. A store id is 1-64 ASCII letters, digits, `.`, `_` and `-`, starting
+with a letter or digit; any other id, such as an email address, is refused on create
+(400), and the warning now says so. Ids that differ only by case name one store; one
+that differs only by punctuation from an existing store is refused on create (409) and
+not found on use (404). The 2.2.25 to 2.2.28 entries below describe the rule before
+then. `create_store` / `createStore` and store listings carry `canonical_id` when the
+normalized form differs.
+
+**Images need both edges of at least 700px**; the docs now say so.
+
 ## 2.2.39 — 2026-09-18
 
 **Rust: the lockfile moves to rustls 0.23.45, for RUSTSEC-2026-0285.** That does not

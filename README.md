@@ -194,7 +194,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Five inside 2.2 were not, deliberately and each with its
+releases are additive. Six inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

@@ -318,8 +318,8 @@ class ClientTests(unittest.TestCase):
         body = json.loads(srv.seen[0]["body"])
         self.assertEqual(body["max_images"], 3)
         self.assertEqual(body["verify"], 2)
-        # the merged call is unchanged: one list, no images, no verify_used
-        self.assertEqual([m["id"] for m in mem.search("q", user_id="alice")], ["m1", "s1"])
+        # the merged call carries the photos too, after the text
+        self.assertEqual([m["id"] for m in mem.search("q", user_id="alice")], ["m1", "s1", "i1"])
 
     def test_search_full_normalizes_a_nulled_field(self):
         srv, mem = self.make([(200, {}, '{"memories": null, "images": null}')])
@@ -726,6 +726,75 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mem.get(user_id="u")  # no memory_id → never reaches the network
 
+    def test_get_takes_a_flat_row(self):
+        srv, mem = self.make([
+            (200, {}, '{"id": "9b2d", "content": "tea", "is_superseded": false}'),
+            (200, {}, '{"user_id": "u", "memory": null}'),
+        ])
+        m = mem.get(user_id="u", memory_id="9b2d")
+        self.assertEqual((m["id"], m["content"]), ("9b2d", "tea"))
+        self.assertEqual(mem.get(user_id="u", memory_id="9b2d"), {})
+
+    def test_forked_child_drops_the_parents_pooled_connections(self):
+        import wontopos
+        srv, mem = self.make([(200, {}, '{"total_memories": 0}')])
+        mem.stats("alice")
+        pools = mem._session.get_adapter(f"http://127.0.0.1:{srv.server_port}").poolmanager.pools
+        self.assertEqual(len(pools), 1)
+        wontopos._drop_pools_after_fork()
+        self.assertEqual(len(pools), 0)
+        self.assertIn(mem.with_user("bob")._session, list(wontopos._sessions))
+
+    def test_search_methods_send_form_and_tz(self):
+        ok = (200, {}, '{"memories": []}')
+        srv, mem = self.make([ok, ok, ok])
+        mem.search("q", user_id="alice", form="memoir", tz=9)
+        mem.search_self("q", user_id="alice", form="archive", tz=-5)
+        mem.search_full("q", user_id="alice", form="memoir", tz=0)
+        sent = [json.loads(r["body"]) for r in srv.seen]
+        self.assertEqual([(b["form"], b["tz"]) for b in sent], [("memoir", 9), ("archive", -5), ("memoir", 0)])
+
+    def test_add_refuses_a_store_name_as_metadata(self):
+        srv, mem = self.make([])
+        for kw in ({"userId": "tenant-42"}, {"store_id": "t"}, {"metadata": {"user_id": "t"}},
+                   {"storeid": "t"}, {"USER_ID": "t"}, {"idempotencyKey": "k"}):
+            with self.assertRaises(ValueError):
+                mem.add("tenant-private fact", **kw)
+        self.assertEqual(srv.seen, [])
+
+    def test_add_keeps_ordinary_metadata_words(self):
+        ok = (200, {}, '{"id": "m1", "status": "stored"}')
+        srv, mem = self.make([ok, ok])
+        mem.add("bought milk", store="Costco")
+        mem.add("asked about models", metadata={"model": "gpt-4o", "user": "bob"})
+        self.assertEqual(len(srv.seen), 2)
+
+    def test_add_keeps_tenant_and_numbered_keys(self):
+        ok = (200, {}, '{"id": "m1", "status": "stored"}')
+        srv, mem = self.make([ok, ok])
+        mem.add("acme note", tenant_id="acme")
+        mem.add("second profile", user_id_2="bob")
+        self.assertEqual(len(srv.seen), 2)
+
+    def test_forked_child_drops_proxy_pools_too(self):
+        import wontopos
+        srv, mem = self.make([])
+        adapter = mem._session.get_adapter("https://api.wontopos.com")
+        pm = adapter.proxy_manager_for("http://127.0.0.1:9")
+        pm.connection_from_host("api.wontopos.com", 443, scheme="https")
+        self.assertEqual(len(pm.pools), 1)
+        wontopos._drop_pools_after_fork()
+        self.assertEqual(len(pm.pools), 0)
+
+    def test_search_returns_image_rows_after_the_text_each_id_once(self):
+        payload = (
+            '{"memories": [{"id": "m1"}, {"id": "dup"}], "self_memories": [{"id": "s1"}],'
+            ' "images": [{"id": "dup"}, {"id": "i1", "content": "", "image_ref": "r"}]}'
+        )
+        srv, mem = self.make([(200, {}, payload), (200, {}, payload)])
+        self.assertEqual([m["id"] for m in mem.search("q", user_id="alice")], ["m1", "dup", "s1", "i1"])
+        self.assertEqual(sorted(mem.search_self("q", user_id="alice")), ["memories", "self_memories"])
+
     # ----- 2.2.17: fuzz-found robustness -----
 
     def test_non_object_2xx_body_is_wos_error(self):
@@ -882,6 +951,12 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["id"], "m1")
         body = json.loads(srv.seen[0]["body"])
         self.assertEqual(body["memory_id"], "11111111-1111-1111-1111-111111111111")
+
+    async def test_get_takes_a_flat_row_like_sync(self):
+        srv, mem = self.make([(200, {}, '{"id": "m1", "content": "tea"}')])
+        async with mem:
+            r = await mem.get("11111111-1111-1111-1111-111111111111")
+        self.assertEqual(r["content"], "tea")
 
     async def test_get_image_actually_reads_bytes_on_the_async_transport(self):
         # There are two transports, and the suite has to walk both. The sync reader
@@ -1205,11 +1280,8 @@ class SearchFiltersTest(unittest.TestCase):
 
 
 class StoreIdCollisionTest(unittest.TestCase):
-    """The API lowercases a store id and rewrites anything outside [a-z0-9_] to '_', so
-    Alice.Smith · alice-smith · alice_smith are **one store**. Measured against
-    production: what was stored under alice-smith came back from a search on Alice.Smith.
-    The most common use of this SDK is one store per end user, so bob.lee@x and
-    bob-lee@x share every memory between them and the response says nothing."""
+    """An id whose normalized form (lowercased, anything outside [a-z0-9_] as '_')
+    differs from it gets one warning naming that form."""
 
     def make(self):
         srv, base = scripted_server([(200, {}, "{}")] * 4)
@@ -1224,7 +1296,17 @@ class StoreIdCollisionTest(unittest.TestCase):
         joined = " ".join(cm.output)
         self.assertIn("Alice.Smith", joined)
         self.assertIn("alice_smith", joined)
-        self.assertIn("share ONE store", joined)
+        self.assertIn("cannot be created beside it (409)", joined)
+
+    def test_an_id_the_api_does_not_accept_gets_its_own_warning(self):
+        for bad in ("bob.lee@example.com", "_alice", "x" * 65):
+            mem = self.make()
+            with self.assertLogs("wontopos", level="WARNING") as cm:
+                mem.add("x", bad)
+            joined = " ".join(cm.output)
+            self.assertIn("is not a valid store id", joined)
+            self.assertIn("refused (400)", joined)
+            self.assertNotIn("409", joined)
 
     def test_silent_when_already_normalized(self):
         # Warning on the normal form is noise, and noise buries the real warning.
@@ -1387,7 +1469,7 @@ class VersionDriftGuardTest(unittest.TestCase):
 class StoreIdWarningBoundTest(unittest.TestCase):
     """If the warning record grows per end user, it leaks in the very case it describes.
 
-    The warning fires on ids that fold — email-shaped ones — and the pattern this SDK
+    The warning fires on ids whose normalized form differs, and the pattern this SDK
     recommends is one store per end user. Unbounded, 50,000 users left 50,000 entries
     for the life of the process (global, so dropping the client changed nothing).
     It is capped now and evicts oldest-first, so a collision that first appears late
