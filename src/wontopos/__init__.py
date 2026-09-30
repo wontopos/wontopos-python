@@ -29,9 +29,8 @@ Japanese, Chinese, English, ...). Storing and searching call no LLM; you pay
 retrieval, not generation.
 
 The API key picks *which memory* (your account); ``model`` picks *which engine* reads
-it. Every model on the shared pool lists, fetches and deletes the same memories, but a
-search may not find memories stored through a different model, so store and search
-with the same one. Set a default on the client, override per call:
+it. Models on the shared pool read the same memory, so you can store with one and
+recall with another. Set a default on the client, override per call:
 
     mem = Client(api_key="wos-...", model="tablet-1")
     mem.recall("...", user_id="alice", model="tablet-1")   # this call only
@@ -83,7 +82,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.41"
+__version__ = "2.2.42"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -130,6 +129,22 @@ _RETRY_ALWAYS = (429,)
 # further along either.
 _RETRY_IF_IDEMPOTENT = (408, 502, 503, 504)
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
+# POST routes that only read. When the deadline cuts short a retry of one, the answer
+# before it still describes the call, as for an idempotent method.
+_READ_POSTS = frozenset({
+    "/api/v1/memory/search",
+    "/api/v1/memory/recall",
+    "/api/v1/memory/get",
+    "/api/v1/memory/list",
+    "/api/v1/memory/stats",
+    "/api/v1/memory/history",
+    "/api/v1/memory/lineage",
+    "/api/v1/memory/by-speaker",
+    "/api/v1/memory/images",
+    "/api/v1/memory/image",
+    "/api/v1/engram/run",
+    "/api/v1/won/revisions",
+})
 # How long the error body of an answer that will be retried gets to arrive. The retry
 # does not need it; it only fills in the error reported if the retry cannot be made.
 _RETRYABLE_BODY_WAIT = 1.0
@@ -1536,7 +1551,8 @@ class _Call:
         self.removes = self.method == "DELETE" if removes is None else removes
         # Whether the answer before an attempt cut short still stands: an idempotent
         # method, or a POST that only reads.
-        self.reads = reads or self.method in _IDEMPOTENT_METHODS
+        self.reads = (reads or self.method in _IDEMPOTENT_METHODS
+                      or (self.method == "POST" and path.split("?", 1)[0] in _READ_POSTS))
         # Set once a retry follows an answer that may have come after the request was
         # applied: 408/502/503/504, or a connection that broke after sending.
         self.maybe_applied = False
@@ -1787,9 +1803,8 @@ class Client:
         hits = mem.search("what does alice drink?", user_id="alice")
 
     The API key picks *which memory* (your account). ``model`` picks *which engine*
-    reads it. Every model on the shared pool lists, fetches and deletes the same
-    memories, but a search may not find memories stored through a different model:
-    store and search with the same one. Set a default on the client, override per call:
+    reads it. Models on the shared pool read the same memory, so you can store
+    with one and recall with another. Set a default on the client, override per call:
 
         mem = Client(api_key="wos-...")                        # tablet-2
         mem.recall("...", user_id="alice")                     # tablet-2

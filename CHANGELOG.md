@@ -6,6 +6,18 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.42 — 2026-09-30
+
+**A read sent as a POST reports the answer before a retry the deadline cuts short**, as
+a GET or DELETE does. That is every call on the search, recall, engram, get, list,
+images, by-speaker, stats, history, lineage and revisions routes, `search_full`,
+`search_self` and Rust's `_with` and `_page` forms included. They raised the status-0
+deadline error there; `get_image` already did this.
+
+**Docs corrected: models on the shared pool read the same memory**, so you can store with
+one and recall with another. The 2.2.41 advice to store and search through one model is
+withdrawn.
+
 ## 2.2.41 — 2026-09-30
 
 **A 409 for a write already in flight is retried**, on every method, after the wait the
@@ -74,10 +86,9 @@ nothing** raises `NotFoundError` saying an earlier attempt may already have appl
 
 **Docs corrected:** a bulk `timestamp` must be RFC3339; dates elsewhere accept a plain
 `YYYY-MM-DD`, and a plain end date covers the whole day; an image needs a caption;
-sending `image.reference` means the service keeps no bytes; a search may not find
-memories stored through a different model; filters do not apply to `self_memories`; an
-idempotency key does not cover a retry that overlaps a first attempt still running;
-features are named by the capability `list_models` reports.
+sending `image.reference` means the service keeps no bytes; filters do not apply to
+`self_memories`; an idempotency key does not cover a retry that overlaps a first attempt
+still running; features are named by the capability `list_models` reports.
 
 **Packaging:** Python requires `requests>=2.32.4` and, for `AsyncClient`,
 `httpx>=0.27,<1`, and declares its license as an SPDX expression. The Rust crate no

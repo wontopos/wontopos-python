@@ -2362,6 +2362,14 @@ class DeadlineReportsTheResponseTest(SyncMake, unittest.TestCase):
             mem.get_image(memory_id=IMAGE_ID)
         self.assertEqual(len(seen), 2)
 
+    def test_a_search_cut_by_the_deadline_reports_the_answer_before_it(self):
+        # A POST that only reads: the 429 before the cut still describes the call.
+        seen, base = staged_server(self, self.STALL_AFTER_429)
+        mem = Client(KEY, base_url=base, timeout=10, deadline=0.8)
+        with self.assertRaises(RateLimitError):
+            mem.search("q", "alice")
+        self.assertEqual(len(seen), 2)
+
     def test_a_write_cut_by_the_deadline_is_status_0(self):
         seen, base = staged_server(self, self.STALL_AFTER_429)
         mem = Client(KEY, base_url=base, timeout=10, deadline=0.8)
@@ -3239,7 +3247,7 @@ class DocsTest(unittest.TestCase):
 
     STALE = (
         r'add\(""\s*,\s*image', r"content may be empty", r"IS the memory", r"Scroll 1\.2\+",
-        r"Tablet 2 and newer", r"Tablet 2\+", r"store with one and recall with another",
+        r"Tablet 2 and newer", r"Tablet 2\+", r"store and search with the same",
         r"max_bytes", r"\bused to\b", r"\b2\.2\.\d+", r"[Mm]easured",
     )
 
