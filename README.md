@@ -112,14 +112,15 @@ hits = mem.search("...the conversation so far...", user_id="alice",
 
 Built in, no configuration needed:
 
-- **Automatic retries** — 429 always, and 408 / 502 / 503 / 504 or a connection error
-  only when a retry cannot double-process a write. The writes and the searches are
-  POSTs, and any of those four may have been returned *after* the write already
-  landed, so those get 429 and connect-level failures only. The reads and the
-  deletes that address a whole store — `list_stores`, `list_speakers`, `delete_store`,
-  `remove_speaker`, `forget_image` — are GET or DELETE and do retry all four. Twice, with
-  exponential backoff + jitter, honoring the server's `Retry-After`. Tune with
-  `Client(retries=...)`; `retries=0` disables.
+- **Automatic retries** — 429 and a 409 for a write already in flight always, and 408 /
+  502 / 503 / 504 or a connection error only when a retry cannot double-process a write.
+  The writes and the searches are POSTs, and any of those four may have been returned
+  *after* the write already landed, so those get 429, that 409 and connect-level
+  failures only. The GET and DELETE calls — `ping`, `list_stores`, `list_speakers`,
+  `list_models`, `list_engrams`, `usage`, `delete_store`, `remove_speaker`,
+  `forget_image` — retry all four. Twice, with exponential backoff + jitter, honoring
+  the server's `Retry-After` up to 30s. Tune with `Client(retries=...)`; `retries=0`
+  disables.
 - **Redirects refused** — the API key never follows a 3xx to another host.
 - **Timeouts** — 30s per attempt by default (`Client(timeout=...)`), and a total
   budget for the whole call across every retry with `Client(deadline=...)` /
@@ -144,7 +145,7 @@ Built in, none of it configurable off:
 - **`Client.from_env()`** reads `WONTOPOS_API_KEY` (or `WOS_API_KEY`) — keep
   keys out of source code.
 - Plain-HTTP base URLs on non-local hosts warn. One dependency (`requests`,
-  floor `>=2.32` for its certificate-verification fix).
+  floor `>=2.32.4`).
 
 ## Errors
 
@@ -194,7 +195,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Six inside 2.2 were not, deliberately and each with its
+releases are additive. Seven inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

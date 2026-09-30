@@ -6,6 +6,88 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.41 — 2026-09-30
+
+**A 409 for a write already in flight is retried**, on every method, after the wait the
+service asks for. A 409 for a store id that collides with an existing one is not
+retried; the error names that store (`conflictsWith` / `conflicts_with`, TypeScript and
+Python).
+
+**When a retry would not fit the deadline, the call raises that response's error**
+(`RateLimitError`, `ServerError`, `ConflictError`) instead of a status-0 deadline error.
+A `Retry-After` over 30 seconds is not waited out: the call raises at once, and
+`RateLimitError` carries `retryAfter` / `retry_after` (TypeScript and Python). A
+`Retry-After` that is neither seconds nor an HTTP date falls back to the normal backoff.
+A retry is not held up by an error body that stops arriving. When the deadline cuts an
+attempt short, a GET or DELETE that was retrying, and `get_image` / `getImage`, raise
+the error of the answer before it; any other call raises the status-0 deadline error.
+
+**Errors say more.** TypeScript and Python errors carry the service's error `type` and
+the rest of its error object as `details`. 413 and 422 are `BadRequestError`
+(`ErrorKind::BadRequest` in Rust). Control characters are removed from server error
+text, and a message says so when the error body could not be read. Network errors no
+longer carry the URL's query string or credentials, and a client's printed form
+(`repr`, `Debug`, `JSON.stringify`, Node's inspect) masks credentials in its base URL.
+Rust's `WosError` implements `source()` and its message names the cause. Python's
+`APIConnectionError` no longer chains the transport exception.
+
+**Refused before sending, where 2.2.40 sent them:** page sizes outside the service's
+range (`list_images`, `export_images`, `iter_images`, `by_speaker` and `revisions`
+(`revisions_page` in Rust) take 5 to 20; `list_memories` takes 1 to 500; `None`/`null`
+still means the default);
+`max_images` outside 0 to 5; a base URL whose scheme is not http or https, or with
+whitespace inside it or a backslash (surrounding whitespace is trimmed); in TypeScript,
+`userId: undefined` in the constructor; in Python, an explicitly empty memory id. Rust
+reports an invalid base URL as `BadRequest` and does not retry it.
+
+**Timeouts:** a value that is not a positive number still means the default; a value
+past what a timer can hold, infinity included, is clamped. In Python `timeout` and
+`deadline` are wall-clock and bound an attempt whose headers or body trickle in; a
+connect that hangs is still retried.
+
+**`add` warns once per metadata key the service does not keep** (it keeps `speaker`,
+`event_date`, `category`, `conversation_id`).
+
+**Python `AsyncClient`:** made before `fork()`, it builds its own connections in the
+child. After `aclose()`, or on a second asyncio event loop, it refuses calls before
+sending. It decodes at most one gzip layer within the 64MB cap, and a corrupt gzip body
+is `APIConnectionError` as on `Client`. TLS trusts certifi's roots as well as the
+operating system's, on both clients.
+
+**Python pickling:** `Client` pickles, and the pickle carries its API key.
+`AsyncClient` does not pickle. Every error class survives pickling. A non-finite number
+in a body raises `ValueError` on both clients, and deeply nested JSON raises `WosError`.
+
+**TypeScript:** a POST whose connection failed after it was sent is not re-sent. A
+custom `fetch` may send the request to another URL; an answer it reports as redirected
+is refused. A page-relative `baseUrl` resolves against `location` where there is one.
+The published types no longer need the DOM library; the two test hooks are deprecated.
+
+**Rust:** `search_full_with` combines filters, `speaker` and any extra field with the
+full answer. An attempt the deadline cuts short is no longer a `Network` error. A read
+is no longer sent again because its error body dropped mid-read. Backoff jitter is
+spread on every platform.
+
+**A repeated cursor after a non-empty page raises** in every iterator and export,
+instead of ending the walk with a partial result. **A retried `DELETE` that finds
+nothing** raises `NotFoundError` saying an earlier attempt may already have applied it.
+
+**Docs corrected:** a bulk `timestamp` must be RFC3339; dates elsewhere accept a plain
+`YYYY-MM-DD`, and a plain end date covers the whole day; an image needs a caption;
+sending `image.reference` means the service keeps no bytes; a search may not find
+memories stored through a different model; filters do not apply to `self_memories`; an
+idempotency key does not cover a retry that overlaps a first attempt still running;
+features are named by the capability `list_models` reports.
+
+**Packaging:** Python requires `requests>=2.32.4` and, for `AsyncClient`,
+`httpx>=0.27,<1`, and declares its license as an SPDX expression. The Rust crate no
+longer lists a documentation URL (crates.io links docs.rs) and does not package the
+fuzz example.
+
+**Correction to 2.2.39:** Rust's `WosError::status()` also changed for two local stops,
+the 20,000-page ceiling (0 to 200) and the 64MB response cap (0 to the response's
+status).
+
 ## 2.2.40 — 2026-09-28
 
 **`get` returns the memory on the default model.** Tablet 2 answers with the memory
@@ -33,9 +115,8 @@ since 2026-09-23. A store id is 1-64 ASCII letters, digits, `.`, `_` and `-`, st
 with a letter or digit; any other id, such as an email address, is refused on create
 (400), and the warning now says so. Ids that differ only by case name one store; one
 that differs only by punctuation from an existing store is refused on create (409) and
-not found on use (404). The 2.2.25 to 2.2.28 entries below describe the rule before
-then. `create_store` / `createStore` and store listings carry `canonical_id` when the
-normalized form differs.
+not found on use (404). `create_store` / `createStore` and store listings carry
+`canonical_id` when the normalized form differs.
 
 **Images need both edges of at least 700px**; the docs now say so.
 

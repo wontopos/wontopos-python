@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "wontopos"
-version = "2.2.40"
+version = "2.2.41"
 description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."
 readme = "README.md"
 authors = [{ name = "Wontopos" }]
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 keywords = ["memory", "ai", "agent", "llm", "multilingual", "rag", "context"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -22,14 +22,16 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# >=2.32: includes the cert-verification fix (CVE-2024-35195); keep the floor current.
-dependencies = ["requests>=2.32"]
+# >=2.32.4: the TLS context this package builds is used from 2.32.3 on, and 2.32.4
+# carries the fix for CVE-2024-47081. Keep the floor current.
+dependencies = ["requests>=2.32.4"]
 
 [project.optional-dependencies]
-async = ["httpx>=0.27"]
+async = ["httpx>=0.27,<1"]
 
 [project.urls]
 Homepage = "https://wontopos.com"
