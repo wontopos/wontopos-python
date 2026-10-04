@@ -6,6 +6,26 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.43 — 2026-10-04
+
+**Types and docs that match what the API sends.** No request or result changes.
+
+- TypeScript's `HistoryTurn` has `role` and `content`, which is what `history()` returns.
+  `user_msg` and `assistant_msg` were never sent; they stay, marked deprecated.
+- TypeScript's `ModelInfo` has `retires_at`, and the model listing docs in all three name
+  it: it is present on a live model that is scheduled to retire, and from that instant
+  calls naming the model are refused.
+- The `by_speaker` docs name `records_to_delete`; `points_to_delete` is the same number
+  under its old name. TypeScript's `SpeakerPage` has both.
+- `add` / `store`: when something was saved, `status` starts with `"stored"` and can carry
+  more text, so match on the prefix; it is `"duplicate"` when nothing was saved. A
+  duplicate can arrive with an empty `id` and no `duplicate_of`; then search with the same
+  text to find the memory it matched. TypeScript's `StoreResult` and the Python and Rust
+  `add` docs say so.
+- `usage` lists `stores` highest spend first, not busiest first.
+- A `list_memories` cursor works with the model that returned it.
+- Rust's `Memory` doc names `speaker` as a typed field.
+
 ## 2.2.42 — 2026-09-30
 
 **A read sent as a POST reports the answer before a retry the deadline cuts short**, as

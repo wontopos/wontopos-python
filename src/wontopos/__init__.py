@@ -82,7 +82,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.42"
+__version__ = "2.2.43"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -2066,6 +2066,12 @@ class Client:
         downscaled to 1568 on the way in, and downscaling means re-encoding: lossless
         formats are written as WebP, so a PNG comes back from ``get_image`` as
         ``image/webp``; JPEG stays JPEG. Under 1568px the bytes are untouched.
+
+        Returns ``{"id", "status"}``. When something was saved, ``status`` starts with
+        ``"stored"`` and can carry more text, so match on the prefix. It is
+        ``"duplicate"`` when nothing was saved. A duplicate can arrive with an empty ``id``
+        and no ``duplicate_of``; then search with the same text to find the memory it
+        matched.
         """
         sid = self._uid(user_id)
         md = _metadata(metadata, extra)
@@ -2365,7 +2371,7 @@ class Client:
         metadata. Paginated: pass the returned ``next_cursor`` back as ``cursor`` for the
         next page, and stop when it is ``None``. It can be non-null on the last page, in
         which case the next call returns an empty page. Pass back only a cursor the
-        service returned. ``limit`` is 1 to 500 (default 100, also for ``None``); anything
+        service returned, with the model that returned it. ``limit`` is 1 to 500 (default 100, also for ``None``); anything
         else is refused.
         Use it to browse or export a store. Omit ``user_id`` for the client's default
         store.
@@ -2528,7 +2534,7 @@ class Client:
         the window. Never another key's. ``balance_cents`` is account-wide, since that
         is what gates the next call whichever key makes it.
 
-        ``stores`` is busiest first and at most 50 rows — a longer list is cut, so the
+        ``stores`` is highest spend first and at most 50 rows — a longer list is cut, so the
         rows need not sum to ``workspace``. A row named ``other`` is an overflow bucket,
         not a store: passing it as a store id finds nothing.
 
@@ -2622,8 +2628,8 @@ class Client:
         words, otherwise a person's name. Same cursor paging as ``list_images``, and the
         same ``limit`` of 5 to 20.
 
-        ``points_to_delete`` is the count to show before anyone confirms a delete of this
-        speaker's memories.
+        ``records_to_delete`` is the count to show before anyone confirms a delete of this
+        speaker's memories; ``points_to_delete`` is the same number under its old name.
         """
         if not isinstance(speaker, str) or not speaker.strip():
             raise ValueError('speaker is required — "me" for the assistant, or a person\'s name')
@@ -2655,6 +2661,9 @@ class Client:
         (a model with its own dedicated memory). ``capabilities`` says what an available
         model can do: ``{"images", "engrams", "forms", "re_ask", "self_memories",
         "speaker_names"}``, each true or false. Needs no API key.
+
+        ``retires_at`` (RFC3339) is present on a live model that is scheduled to retire.
+        From that instant the model leaves this list and calls naming it are refused.
         """
         return _as_records(self._request("GET", "/api/v1/models").get("models"))
 
@@ -3348,7 +3357,7 @@ class AsyncClient:
         """List a store's stored memories — the text you stored, and its metadata.
         Paginated via ``cursor``/``next_cursor``: stop when it is ``None``. It can be
         non-null on the last page (the next call returns an empty page); pass back only a
-        cursor the service returned. ``limit`` is 1 to 500 (default 100, also for ``None``).
+        cursor the service returned, with the model that returned it. ``limit`` is 1 to 500 (default 100, also for ``None``).
         Returns ``{"memories": [...], "count": int, "next_cursor": str | None}``.
         """
         limit = _list_size(limit, "limit")
@@ -3466,7 +3475,7 @@ class AsyncClient:
         the window. Never another key's. ``balance_cents`` is account-wide, since that
         is what gates the next call whichever key makes it.
 
-        ``stores`` is busiest first and at most 50 rows — a longer list is cut, so the
+        ``stores`` is highest spend first and at most 50 rows — a longer list is cut, so the
         rows need not sum to ``workspace``. A row named ``other`` is an overflow bucket,
         not a store: passing it as a store id finds nothing.
 
