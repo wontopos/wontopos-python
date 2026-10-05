@@ -2788,6 +2788,27 @@ class ErrorFieldsTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.details, {"model": "tablet-1", "endpoint": "images"})
         self.assertEqual(cm.exception.type, "api_error")
 
+    GONE = envelope("gone_error", "Scroll 1 now exists only in memory.", "req_410", code=0)
+
+    def test_410_is_gone_says_what_to_do_and_is_not_retried(self):
+        srv, mem = self.make([(410, {}, self.GONE)] * 3)
+        with self.assertRaises(wontopos.GoneError) as cm:
+            mem.search("q", "alice")
+        e = cm.exception
+        self.assertIsInstance(e, wontopos.WosError)
+        self.assertEqual((e.status, e.type, e.request_id), (410, "gone_error", "req_410"))
+        self.assertIn("Scroll 1 now exists only in memory.", e.message)
+        self.assertIn("list_models()", e.message)
+        self.assertEqual(len(srv.seen), 1, "retrying a retired model can never succeed")
+
+    async def test_async_410_is_gone(self):
+        srv, mem = self.amake([(410, {}, self.GONE)] * 3)
+        async with mem:
+            with self.assertRaises(wontopos.GoneError) as cm:
+                await mem.search("q", "alice")
+        self.assertIn("list_models()", cm.exception.message)
+        self.assertEqual(len(srv.seen), 1)
+
     def test_413_and_422_are_bad_requests(self):
         for status in (413, 422):
             with self.subTest(status=status):

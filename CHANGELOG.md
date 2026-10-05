@@ -6,6 +6,15 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.44 — 2026-10-05
+
+**A retired model has its own error.** A model past its retirement answers `410`. Python
+and TypeScript raise it as `GoneError`, a `WosError` subclass, and Rust's
+`WosError::is_gone()` is true for it; before, it arrived as a plain `WosError` (in Rust,
+`ErrorKind::Other`, which it still is). The message says what to do: `list_models()`
+(`listModels()` in TypeScript) lists the models you can use. It is not retried, as before,
+and `delete_store` still works under a retired model.
+
 ## 2.2.43 — 2026-10-04
 
 **Types and docs that match what the API sends.** No request or result changes.

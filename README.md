@@ -166,6 +166,10 @@ except WosError as e:
         print(e.status, e.message, e.request_id)
 ```
 
+A retired model answers `410`, raised as `GoneError`: retrying cannot succeed, so name
+a live model (`list_models()` lists them, with `retires_at` on one that is scheduled to
+retire). `delete_store` still works under a retired model.
+
 ## A different API host
 
 Point the client somewhere other than the default endpoint - a dedicated region,

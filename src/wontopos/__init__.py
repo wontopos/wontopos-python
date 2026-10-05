@@ -82,7 +82,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.43"
+__version__ = "2.2.44"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -91,7 +91,7 @@ __all__ = [
     "Client", "AsyncClient", "WME",
     "WosError", "APIConnectionError", "AuthenticationError", "BadRequestError",
     "ConflictError", "NotFoundError", "PaymentRequiredError",
-    "PermissionDeniedError", "RateLimitError", "ServerError",
+    "PermissionDeniedError", "RateLimitError", "ServerError", "GoneError",
     "DEFAULT_BASE_URL", "DEFAULT_MODEL", "__version__",
 ]
 
@@ -1367,6 +1367,12 @@ class ConflictError(WosError):
         return v if isinstance(v, str) else None
 
 
+class GoneError(WosError):
+    """410 — the model this call named is retired. Retrying cannot succeed: name a live
+    model instead (``list_models()`` lists them). ``delete_store`` still works under a
+    retired model."""
+
+
 class RateLimitError(WosError):
     """429 — too many requests. The client already retries these, waiting as long as
     ``Retry-After`` asks, up to 30s.
@@ -1394,14 +1400,20 @@ _STATUS_ERRORS = {
     403: PermissionDeniedError,
     404: NotFoundError,
     409: ConflictError,
+    410: GoneError,
     413: BadRequestError,
     422: BadRequestError,
     429: RateLimitError,
 }
 
 
+_GONE_HINT = "This model is retired; list_models() lists the ones you can use."
+
+
 def _make_error(status: int, message: str, request_id: Optional[str] = None, *,
                 type: Optional[str] = None, details: Optional[dict] = None) -> WosError:
+    if status == 410:
+        message = f"{message} {_GONE_HINT}"
     if status == 0:
         cls: Any = APIConnectionError
     elif status in _STATUS_ERRORS:
