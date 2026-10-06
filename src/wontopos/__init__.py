@@ -82,7 +82,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.44"
+__version__ = "2.2.45"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -311,6 +311,18 @@ CONTEXT_LIMIT_MIN = 0
 CONTEXT_LIMIT_MAX = 20
 
 
+def _is_int(v: Any) -> bool:
+    """An integer of any kind (numpy's included), but not a bool."""
+    return isinstance(v, numbers.Integral) and not isinstance(v, bool)
+
+
+def _json_default(o: Any) -> Any:
+    """Lets an integer of another type (numpy's) that passed the checks reach the wire."""
+    if _is_int(o):
+        return int(o)
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 def _check_count(limit: int, name: str = "limit") -> None:
     """The 5-to-20 count shared by ``search`` and ``recall``, refused out of range
     rather than quietly adjusted: asking for 20 and silently getting 10 reads as "that
@@ -320,11 +332,11 @@ def _check_count(limit: int, name: str = "limit") -> None:
     nothing was sent, and ``WosError`` with status 0 is ``APIConnectionError`` — "the
     request never got a response" — which a caller may retry.
     """
-    if not isinstance(limit, int) or isinstance(limit, bool):
+    if not _is_int(limit):
         raise ValueError(f"{name} must be an int, got {type(limit).__name__}")
     if limit < SEARCH_LIMIT_MIN or limit > SEARCH_LIMIT_MAX:
         raise ValueError(
-            f"{name} must be between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {limit}. "
+            f"{name} must be an integer between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {limit}. "
             "Out of range is refused rather than adjusted, so a short answer always "
             "means the store was short."
         )
@@ -335,11 +347,11 @@ def _check_context_limit(n: int) -> None:
 
     0 is a real answer ("attach none"), not a missing value, so it must pass.
     """
-    if not isinstance(n, int) or isinstance(n, bool):
+    if not _is_int(n):
         raise ValueError(f"context_limit must be an int, got {type(n).__name__}")
     if n < CONTEXT_LIMIT_MIN or n > CONTEXT_LIMIT_MAX:
         raise ValueError(
-            f"context_limit must be between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {n}."
+            f"context_limit must be an integer between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {n}."
         )
 
 
@@ -353,12 +365,18 @@ _MAX_IMAGES = 5
 def _check_int(value: Any, name: str, lo: int, hi: int) -> None:
     """An integer in ``lo..hi``; anything else (a bool, a float, NaN, a string, out of
     range) is refused before sending."""
-    if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+    if not _is_int(value) or not lo <= value <= hi:
         raise ValueError(f"{name} must be an integer between {lo} and {hi}, got {value!r}.")
 
 
 def _check_page(value: Any, name: str = "limit") -> None:
     _check_int(value, name, _PAGE_MIN, _PAGE_MAX)
+
+
+def _check_include(include: Any) -> None:
+    """``revisions``' side: refused before sending, since the service's 400 names no field."""
+    if include is not None and include not in ("revised", "unrevised"):
+        raise ValueError(f'include must be "revised" or "unrevised", got {include!r}.')
 
 
 def _list_size(value: Any, name: str) -> int:
@@ -419,8 +437,12 @@ def _warn_on_unknown_metadata(md: dict) -> None:
 
 
 def _metadata(metadata: Optional[dict], extra: dict) -> dict:
+    # Checked before a None is set aside: userId=None is still a store named in the wrong
+    # place, and dropping it first would send the write to the default store.
+    bad = sorted(k for k in {**(metadata or {}), **extra} if _names_a_store(k))
+    # A keyword of None is "not given": it neither overrides metadata= nor is sent.
+    extra = {k: v for k, v in extra.items() if v is not None}
     md = {**metadata, **extra} if metadata else extra
-    bad = sorted(k for k in md if _names_a_store(k))
     if bad:
         raise ValueError(
             f"{bad[0]!r} is not a metadata field: pass the store as user_id= and an "
@@ -488,7 +510,8 @@ def _search_body(store_id: str, query: str, limit: Optional[int], opts: dict,
         limit = 10
     _check_count(limit)
     extra = opts.get("extra") or {}
-    known = {k: v for k, v in opts.items() if k != "extra"}
+    # None means "not given"; sent as null, speaker and cache_control are a 400.
+    known = {k: v for k, v in opts.items() if k != "extra" and v is not None}
     body = {**extra, **known, "user_id": store_id, "query": query, "max_results": limit}
     if verify is not None:
         body["verify"] = verify
@@ -498,6 +521,13 @@ def _search_body(store_id: str, query: str, limit: Optional[int], opts: dict,
     if body.get("max_images") is not None:
         _check_int(body["max_images"], "max_images", 0, _MAX_IMAGES)
     return body
+
+def _speakers_list(r: Any) -> dict:
+    """``list_speakers``' reply with ``speakers`` always a list, as TypeScript returns it."""
+    out = dict(r) if isinstance(r, dict) else {}
+    out["speakers"] = _as_records(r.get("speakers") if isinstance(r, dict) else None)
+    return out
+
 
 def _reset_warning_state() -> None:
     """For tests — each warning is emitted once per process, globally."""
@@ -1663,7 +1693,7 @@ def _encode_json(body: Any) -> Optional[bytes]:
     if body is None:
         return None
     try:
-        text = json.dumps(body, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
+        text = json.dumps(body, allow_nan=False, ensure_ascii=False, separators=(",", ":"), default=_json_default)
     except ValueError as e:
         raise ValueError(f"request body is not valid JSON: {e}") from None
     except TypeError as e:
@@ -1672,7 +1702,7 @@ def _encode_json(body: Any) -> Optional[bytes]:
         return text.encode("utf-8")
     except UnicodeEncodeError:
         # A lone surrogate cannot be UTF-8; escaped, it is still valid JSON.
-        return json.dumps(body, allow_nan=False, separators=(",", ":")).encode("ascii")
+        return json.dumps(body, allow_nan=False, separators=(",", ":"), default=_json_default).encode("ascii")
 
 
 def _off_the_wire(r: Any) -> bool:
@@ -1829,8 +1859,8 @@ class Client:
 
     Args:
         api_key:  your Wontopos API key (sent as ``X-API-Key``).
-        base_url: API base URL (defaults to the hosted service). Whitespace or a
-                  backslash in it is refused.
+        base_url: API base URL (defaults to the hosted service). Whitespace at either
+                  end is trimmed; whitespace inside it, or a backslash, is refused.
         timeout:  wall-clock limit for one attempt, in seconds, however slowly the
                   response arrives. Each retry gets its own.
         model:    default model for every call (sent as ``X-WOS-Model``).
@@ -2056,7 +2086,8 @@ class Client:
             mem.add("...", "alice", metadata={"speaker": "me"})   # same as speaker="me"
 
         A loose keyword wins on a conflict, because it is the more specific thing the
-        caller just typed.
+        caller just typed. A keyword of ``None`` counts as not given: it is not sent and
+        does not override ``metadata=``, which is sent as given.
 
         ``image=`` attaches an image, on a model that lists the ``images`` capability in
         ``list_models()``::
@@ -2118,7 +2149,7 @@ class Client:
         )
 
     def add_bulk(
-        self, content: str, user_id: Optional[str] = None, category: str = "general",
+        self, content: str, user_id: Optional[str] = None, category: Optional[str] = "general",
         timestamp: Optional[str] = None, *, model: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> dict:
@@ -2129,7 +2160,8 @@ class Client:
         memory is filed at upload time. ``user_id`` is optional — omit it to use the
         client's default store.
         """
-        body: dict[str, Any] = {"user_id": self._uid(user_id), "content": content, "category": category}
+        body: dict[str, Any] = {"user_id": self._uid(user_id), "content": content,
+                                "category": "general" if category is None else category}
         if timestamp:
             body["timestamp"] = timestamp
         return self._post("/api/v1/memory/bulk-store", body, model=model,
@@ -2554,7 +2586,7 @@ class Client:
             if u["balance_cents"] < 100:
                 stop()
         """
-        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 365:
+        if not _is_int(days) or not 1 <= days <= 365:
             raise ValueError(f"days must be an integer between 1 and 365, got {days!r}.")
         return self._request("GET", f"/api/v1/won/usage?days={days}")
 
@@ -2603,6 +2635,7 @@ class Client:
         Deletions are NOT counted — a deleted memory leaves nothing to count. ``total``
         counts the memories you stored.
         """
+        _check_include(include)
         if limit is not None:
             _check_page(limit)
         body: dict = {"user_id": self._uid(user_id)}
@@ -2748,8 +2781,9 @@ class Client:
         return self._post("/api/v1/memory/speakers", {"user_id": self._uid(user_id), "speaker": speaker})
 
     def list_speakers(self, user_id: Optional[str] = None) -> dict:
-        """The store's registered people, each with its memory count."""
-        return self._request("GET", "/api/v1/memory/speakers", params={"user_id": self._uid(user_id)})
+        """The store's registered people, each with its memory count:
+        ``{"speakers": [...], ...}``, with ``speakers`` always a list."""
+        return _speakers_list(self._request("GET", "/api/v1/memory/speakers", params={"user_id": self._uid(user_id)}))
 
     def remove_speaker(self, speaker: str, user_id: Optional[str] = None) -> dict:
         """Unregister a person. Their memories stay; the name tag goes."""
@@ -3045,8 +3079,8 @@ class AsyncClient:
     sent.
 
     Same reliability and security posture as the sync client: retries with backoff
-    (429, a 409 for a write in flight, 408/502/503/504 + connect errors, ``Retry-After``
-    honored), wall-clock ``timeout`` and ``deadline``, redirects refused, TLS 1.2 floor,
+    (429 and a 409 for a write in flight on every call; 408/502/503/504 and connect
+    errors only where a retry cannot apply a write twice; ``Retry-After`` honored), wall-clock ``timeout`` and ``deadline``, redirects refused, TLS 1.2 floor,
     64MB response cap, key masked in ``repr``. Close it with ``await mem.aclose()`` or
     use ``async with``.
     """
@@ -3237,13 +3271,14 @@ class AsyncClient:
         )
 
     async def add_bulk(
-        self, content: str, user_id: Optional[str] = None, category: str = "general",
+        self, content: str, user_id: Optional[str] = None, category: Optional[str] = "general",
         timestamp: Optional[str] = None, *, model: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> dict:
         """Bulk-ingest a large blob of text in one call. ``timestamp`` must be RFC3339;
         anything else is ignored and the memory is filed at upload time."""
-        body: dict[str, Any] = {"user_id": self._uid(user_id), "content": content, "category": category}
+        body: dict[str, Any] = {"user_id": self._uid(user_id), "content": content,
+                                "category": "general" if category is None else category}
         if timestamp:
             body["timestamp"] = timestamp
         return await self._post("/api/v1/memory/bulk-store", body, model=model,
@@ -3495,7 +3530,7 @@ class AsyncClient:
             if u["balance_cents"] < 100:
                 stop()
         """
-        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 365:
+        if not _is_int(days) or not 1 <= days <= 365:
             raise ValueError(f"days must be an integer between 1 and 365, got {days!r}.")
         return await self._request("GET", f"/api/v1/won/usage?days={days}")
 
@@ -3507,6 +3542,7 @@ class AsyncClient:
         """How much of this store has been altered since it was written.
 
         Counts only unless ``include`` asks for a page. See ``Client.revisions``."""
+        _check_include(include)
         if limit is not None:
             _check_page(limit)
         body: dict = {"user_id": self._uid(user_id)}
@@ -3599,7 +3635,7 @@ class AsyncClient:
 
     async def list_speakers(self, user_id: Optional[str] = None) -> dict:
         """The store's registered people, each with its memory count."""
-        return await self._request("GET", "/api/v1/memory/speakers", params={"user_id": self._uid(user_id)})
+        return _speakers_list(await self._request("GET", "/api/v1/memory/speakers", params={"user_id": self._uid(user_id)}))
 
     async def remove_speaker(self, speaker: str, user_id: Optional[str] = None) -> dict:
         """Unregister a person. Their memories stay; the name tag goes."""

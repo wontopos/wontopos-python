@@ -5,7 +5,7 @@ pip install wontopos
 ```
 
 Get an API key in the [console](https://wontopos.com). Keys look like `wos-live-...`;
-the client also reads `WONTOPOS_API_KEY` from the environment.
+`Client.from_env()` reads `WONTOPOS_API_KEY` from the environment instead.
 
 ```python
 from wontopos import Client
@@ -81,15 +81,19 @@ pip install "wontopos[async]"
 ```
 
 ```python
+import asyncio
 from wontopos import AsyncClient
 
-async with AsyncClient(api_key="wos-live-...", user_id="alice") as mem:
-    await mem.add("she prefers tea over coffee")
-    hits = await mem.search("what does alice drink?")
+async def main():
+    async with AsyncClient(api_key="wos-live-...", user_id="alice") as mem:
+        await mem.add("she prefers tea over coffee")
+        hits = await mem.search("what does alice drink?")
+
+asyncio.run(main())
 ```
 
-Every `Client` method exists on `AsyncClient` with identical arguments and
-semantics (retries, redirect refusal, guards). Close with `async with` or
+Every `Client` method but `close` exists on `AsyncClient` with identical arguments
+and semantics (retries, redirect refusal, guards). Close it with `async with` or
 `await mem.aclose()`.
 
 ## Recall caching
@@ -199,7 +203,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Eight inside 2.2 were not, deliberately and each with its
+releases are additive. Nine inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

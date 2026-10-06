@@ -3,6 +3,7 @@
 import contextlib
 import logging
 import json
+import numbers
 import os
 import re
 import sys
@@ -2808,6 +2809,52 @@ class ErrorFieldsTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
                 await mem.search("q", "alice")
         self.assertIn("list_models()", cm.exception.message)
         self.assertEqual(len(srv.seen), 1)
+
+    def test_revisions_include_is_checked_before_sending(self):
+        srv, mem = self.make([])
+        with self.assertRaisesRegex(ValueError, 'include must be "revised" or "unrevised"'):
+            mem.revisions("alice", include="both")
+        self.assertEqual(srv.seen, [])
+
+    def test_none_options_are_left_out_not_sent_as_null(self):
+        srv, mem = self.make([(200, {}, '{"id":"m1","status":"stored"}'),
+                              (200, {}, '{"memories":[]}'),
+                              (200, {}, '{"status":"stored"}')])
+        mem.add("x", "alice", metadata={"speaker": "me"}, speaker=None, category="work")
+        mem.search("q", "alice", speaker=None, cache_control=None)
+        mem.add_bulk("long text", "alice", category=None)
+        add, search, bulk = (json.loads(r["body"]) for r in srv.seen)
+        self.assertEqual(add["metadata"], {"speaker": "me", "category": "work"})
+        self.assertNotIn("speaker", search)
+        self.assertNotIn("cache_control", search)
+        self.assertEqual(bulk["category"], "general")
+
+    def test_a_store_keyword_of_none_is_still_refused(self):
+        srv, mem = self.make([])
+        for key in ("userId", "store_id", "idempotencyKey"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "is not a metadata field"):
+                mem.add("x", "alice", **{key: None})
+        self.assertEqual(srv.seen, [])
+
+    def test_an_integer_of_another_type_is_accepted_and_sent_as_an_int(self):
+        class OtherInt:  # what numpy's integers look like to the checks
+            def __init__(self, v): self.v = v
+            def __int__(self): return self.v
+            def __index__(self): return self.v
+            def __lt__(self, o): return self.v < o
+            def __le__(self, o): return self.v <= o
+            def __gt__(self, o): return self.v > o
+            def __ge__(self, o): return self.v >= o
+        numbers.Integral.register(OtherInt)
+        srv, mem = self.make([(200, {}, '{"memories":[]}')])
+        mem.search("q", "alice", limit=OtherInt(7))
+        self.assertEqual(json.loads(srv.seen[0]["body"])["max_results"], 7)
+        with self.assertRaises(ValueError):
+            mem.search("q", "alice", limit=True)
+
+    def test_list_speakers_always_has_a_list(self):
+        srv, mem = self.make([(200, {}, '{"speakers":null}')])
+        self.assertEqual(mem.list_speakers("alice")["speakers"], [])
 
     def test_413_and_422_are_bad_requests(self):
         for status in (413, 422):

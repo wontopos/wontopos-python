@@ -6,6 +6,37 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.45 — 2026-10-06
+
+**The three clients refuse the same arguments in the same words.**
+
+- `revisions` (`revisions_page` in Rust) refuses an `include` other than `"revised"` or
+  `"unrevised"` before sending, in all three. The service answered such a value with a
+  400 that named no field. In Python this is now a `ValueError` and in TypeScript an
+  `Error`, where it was a `BadRequestError`; Rust still returns `ErrorKind::BadRequest`.
+  A `null` include is left out in TypeScript, as Python leaves out `None`.
+- A count out of range is refused with one sentence in all three: `<name> must be an
+  integer between <min> and <max>, got <value>.` Python's search and recall counts and
+  Rust's counts said "must be between", and Rust's `max_images` "a whole number".
+- Python leaves out a keyword of `None` instead of sending `null`; a `null` speaker or
+  `cache_control` was a 400. Such a keyword does not override the same key in
+  `metadata=`, which is sent as given, as before and as in TypeScript and Rust.
+  TypeScript leaves out a search option of `null` the same way. `add_bulk(category=None)` sends `general`,
+  and so does TypeScript's `addBulk` for a `null` category. Counts accept an integer of any type, numpy's included; a `bool` is
+  still refused.
+- TypeScript warns once about a write option a call does not take, such as
+  `idempotency_key` (the option is `idempotencyKey`), or `image` anywhere but `add`. It was dropped without a word, so a
+  re-run could store a memory twice.
+- Rust's `with_model("")` sends no model header, so the service's default model answers,
+  as in Python and TypeScript; it was refused. A name of only whitespace is still refused. `list_speakers` always carries a `speakers` list in Python and Rust, and Rust's
+  `list_engrams` an `engrams` and a `forms` list, as TypeScript's do.
+- Docs: the READMEs say `from_env()` (`fromEnv()` in TypeScript) reads `WONTOPOS_API_KEY`;
+  a client does not read it on its own. The Python async example runs as a script, the
+  TypeScript proxy example imports `Client`, five TypeScript methods take the store
+  positionally (`getImage` among them), and search options pass through only under
+  `extra`. Rust's crate doc no longer says every timeout is unretried: one at connect
+  time is retried.
+
 ## 2.2.44 — 2026-10-05
 
 **A retired model has its own error.** A model past its retirement answers `410`. Python
