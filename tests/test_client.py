@@ -3928,6 +3928,29 @@ class NoAsyncioLoopTest(AsyncMake, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(conns), 2)
 
 
+class ReadPostRetryTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
+    """search and recall go as POST and were retried by method only: a 503 a GET would
+    have retried reached the caller. A write still is not sent again."""
+
+    BUSY = (503, {"Retry-After": "0"}, b"{}")
+
+    def test_sync(self):
+        for status in (502, 503, 504):
+            srv, mem = self.make([(status, {"Retry-After": "0"}, b"{}"), (200, {}, b'{"memories":[]}')])
+            mem.search("q", "alice")
+            self.assertEqual(len(srv.seen), 2, status)
+        srv, mem = self.make([self.BUSY, (200, {}, b'{"id":"m1","status":"stored"}')])
+        with self.assertRaises(wontopos.ServerError):
+            mem.add("x", "alice")
+        self.assertEqual(len(srv.seen), 1)
+
+    async def test_async(self):
+        srv, mem = self.amake([self.BUSY, (200, {}, b'{"long_term":{"memories":[]}}')])
+        async with mem:
+            await mem.recall("q", "alice")
+        self.assertEqual(len(srv.seen), 2)
+
+
 class UndecodableBodyTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
     """A 2xx body that cannot be decoded is a transport failure, APIConnectionError with
     status 0, in both clients: a read is retried and a write is not."""
@@ -3941,9 +3964,14 @@ class UndecodableBodyTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase)
             mem.list_models()
         self.assertEqual(cm.exception.status, 0)
         self.assertEqual(len(srv.seen), 2)
+        # stats is a POST that only reads: retried like a GET.
         srv, mem = self.make([self.BAD_GZIP] * 2, retries=1)
         with self.assertRaises(APIConnectionError):
             mem.stats("alice")
+        self.assertEqual(len(srv.seen), 2)
+        srv, mem = self.make([self.BAD_GZIP] * 2, retries=1)
+        with self.assertRaises(APIConnectionError):
+            mem.add("x", "alice")
         self.assertEqual(len(srv.seen), 1)
 
     async def test_async(self):
@@ -3960,6 +3988,11 @@ class UndecodableBodyTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase)
                 async with mem:
                     with self.assertRaises(APIConnectionError):
                         await mem.stats("alice")
+                self.assertEqual(len(srv.seen), 2)
+                srv, mem = self.amake([bad] * 2, retries=1)
+                async with mem:
+                    with self.assertRaises(APIConnectionError):
+                        await mem.add("x", "alice")
                 self.assertEqual(len(srv.seen), 1)
 
     async def test_async_error_status_still_stands(self):

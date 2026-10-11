@@ -6,6 +6,41 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.46 — 2026-10-09
+
+**Reads are retried, and the docs say what the service does.**
+
+- A call that only reads is retried on 408/502/503/504 and on an answer that dropped
+  mid-body, in all three: `search`, `recall`, `get`, `list_memories`, `stats`, `history`,
+  `lineage`, `by_speaker`, the image listing and fetch, `engram` and `revisions` go as
+  POST, and the clients decided from the method alone, so none of them was retried,
+  though the docs said reads were. A 503 "Retry in a moment" on a read now reaches
+  the caller only when the retries run out. A write sent as POST is not sent again on those, and a timeout
+  after the request went out is still not retried.
+- Docs, where they said what is not so:
+  - Photos: a long edge between 1568px and 2500px is downscaled to 1568; over 2500px,
+    or an image file over 7MB, is refused (400) with the reason. They said every long
+    edge over 1568px was downscaled.
+  - `recall` returns the recent turns, at most `limit` memories and at most
+    `context_limit` rows of the surrounding conversation. The READMEs called it a fixed slice
+    of about 1,000 tokens.
+  - The no-LLM line reads: no language model reads your stored memories.
+  - `lineage` follows the edits from the id you pass forward; pass the first version's
+    id to see the whole history. It was described as the whole chain behind any id.
+  - Filters: a narrow filter can return fewer than `limit` even when the store holds
+    more inside it. A memory with no `event_date` is matched by when it was stored.
+  - `search` lists memories best first, then the assistant's own words and image
+    memories in their own order, and each `verify` pass can add up to `limit` more.
+  - `usage`: `workspace` and `stores` include every key in the workspace; `key` is this
+    key's own. `remove_speaker` leaves the name on stored memories on `tablet-2`. A 402
+    can also mean the month's spend cap for the account's tier. Recall caching bills a
+    repeated query at 0.1x, and an extended one at 0.1x for its cached part only.
+  - `get` no longer promises a 404 for every id `list_memories` would not show,
+    `stats` says its total can be larger than what `list_memories` lists,
+    `verify_used` counts passes that added memories, an API key picks a workspace's
+    memory (it said an account's), and Python's examples create the store and register
+    a speaker before using them.
+
 ## 2.2.45 — 2026-10-06
 
 **The three clients refuse the same arguments in the same words.**

@@ -25,10 +25,10 @@ Stores are explicit: the ``user_id`` you read/write under must exist first
 
 Recall quality does not depend on which language a memory was written in, so a
 memory stored in one language is found by a question asked in another (Korean,
-Japanese, Chinese, English, ...). Storing and searching call no LLM; you pay
+Japanese, Chinese, English, ...). No language model reads your stored memories; you pay
 retrieval, not generation.
 
-The API key picks *which memory* (your account); ``model`` picks *which engine* reads
+The API key picks *which memory* (your workspace); ``model`` picks *which engine* reads
 it. Models on the shared pool read the same memory, so you can store with one and
 recall with another. Set a default on the client, override per call:
 
@@ -38,7 +38,7 @@ recall with another. Set a default on the client, override per call:
 Reliability: every call retries transient failures with exponential backoff +
 jitter, honoring ``Retry-After`` up to 30s — 429 and a 409 for a write already in
 flight on every call; 408/502/503/504 and connection errors only when a retry cannot
-apply a write twice (idempotent calls, or a failure at connect time). ``timeout=``
+apply a write twice (reads, the DELETE calls, or a failure at connect time). ``timeout=``
 bounds each attempt and ``deadline=`` the whole call, in wall-clock time. Tune with
 ``Client(retries=...)`` (0 disables), or per call site via the ``with_timeout()`` /
 ``with_retries()`` / ``with_deadline()`` clones.
@@ -82,7 +82,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.45"
+__version__ = "2.2.46"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -539,8 +539,9 @@ def _reset_warning_state() -> None:
 def _normalize_image(image: Any) -> dict:
     """Put an image into the shape the API expects, checking only what cannot change.
 
-    Deliberately NOT checked here: the size limits, which the service enforces — a 10MB
-    request body, a 700px minimum edge, and the long edge downscaled to 1568px.
+    Deliberately NOT checked here: the size limits, which the service enforces: a 10MB
+    request body, a 7MB image file, a 700px minimum edge and a 2500px maximum long edge,
+    with a long edge over 1568px downscaled to 1568px.
 
     What IS checked is the part that silently breaks: a ``data:image/jpeg;base64,`` prefix.
     Browsers and file pickers hand you the whole data URL, the API wants only what follows
@@ -1167,13 +1168,14 @@ def _lock_wait(err: "WosError") -> Optional[float]:
     return ms / 1000.0
 
 
-def _retry_wait(status: int, method: str, retry_after: Optional[str], err: Optional["WosError"],
+def _retry_wait(status: int, reads: bool, retry_after: Optional[str], err: Optional["WosError"],
                 attempt: int) -> Optional[float]:
     """Seconds to wait before retrying this response, or None when it is final.
 
     A 429, and a 409 for a write already in flight, are answered before anything is
-    stored, so every method retries them. 408/502/503/504 retry only an idempotent method:
-    a write may already have been applied. A wait over 30s is final.
+    stored, so every method retries them. 408/502/503/504 retry only a call that only
+    reads (``reads``: an idempotent method, or a POST in ``_READ_POSTS``): a write may
+    already have been applied. A wait over 30s is final.
     """
     if status == 409:
         wait = _lock_wait(err)
@@ -1181,7 +1183,7 @@ def _retry_wait(status: int, method: str, retry_after: Optional[str], err: Optio
             return None
         return max(wait, _backoff(attempt))
     if status in _RETRY_ALWAYS or (
-        status in _RETRY_IF_IDEMPOTENT and method.upper() in _IDEMPOTENT_METHODS
+        status in _RETRY_IF_IDEMPOTENT and reads
     ):
         ra = _parse_retry_after(retry_after)
         if ra is None:
@@ -1369,7 +1371,9 @@ class AuthenticationError(WosError):
 
 
 class PaymentRequiredError(WosError):
-    """402 — no card on file or the balance is depleted. Top up to continue."""
+    """402 — no card on file, the balance is depleted, or the month's spend cap for the
+    account's tier is reached (``details["reason"]`` is ``"tier_cap_reached"``). Top up to
+    continue; a top-up also raises the tier."""
 
 
 class PermissionDeniedError(WosError):
@@ -1591,8 +1595,10 @@ class _Call:
         self.deadline_at = _deadline_at(deadline)
         # Whether the call deletes something (a DELETE, unless it only previews).
         self.removes = self.method == "DELETE" if removes is None else removes
-        # Whether the answer before an attempt cut short still stands: an idempotent
-        # method, or a POST that only reads.
+        # Whether the call only reads (an idempotent method, or a POST that only reads):
+        # safe to send again on a 408/502/503/504 or a dropped answer, and the answer
+        # before an attempt cut short still stands. Reads go as POST, and were retried by
+        # method only, so search and recall were never retried.
         self.reads = (reads or self.method in _IDEMPOTENT_METHODS
                       or (self.method == "POST" and path.split("?", 1)[0] in _READ_POSTS))
         # Set once a retry follows an answer that may have come after the request was
@@ -1625,7 +1631,7 @@ class _Call:
         decided by its body, so never."""
         if status == 409 or not self._more():
             return False
-        wait = _retry_wait(status, self.method, headers.get("Retry-After"), None, self.attempt)
+        wait = _retry_wait(status, self.reads, headers.get("Retry-After"), None, self.attempt)
         return wait is not None and self._fits(wait)
 
     def after_failure(self, f: _Failure, clock: _Clock) -> float:
@@ -1636,9 +1642,9 @@ class _Call:
             if clock.by_deadline and previous is not None and self.reads:
                 raise self._final(previous)
             raise clock.error()
-        # Retry only when it cannot apply a write twice: an idempotent method, or a
+        # Retry only when it cannot apply a write twice: a call that only reads, or a
         # failure while connecting, before the request left.
-        retryable = f.never_sent or (f.dropped and self.method in _IDEMPOTENT_METHODS)
+        retryable = f.never_sent or (f.dropped and self.reads)
         wait = _backoff(self.attempt)
         if retryable and (self._more() or self._spent()) and not self._fits(wait):
             # The deadline, not the retry count, ends the call, and this attempt got no
@@ -1666,7 +1672,7 @@ class _Call:
         retry_after = headers.get("Retry-After")
         if isinstance(err, RateLimitError):
             err.retry_after = _parse_retry_after(retry_after)
-        wait = _retry_wait(status, self.method, retry_after, err, self.attempt)
+        wait = _retry_wait(status, self.reads, retry_after, err, self.attempt)
         # A wait that does not fit the deadline ends the call with this response's error.
         if wait is None or not self._more() or not self._fits(wait):
             raise self._final(err)
@@ -1841,10 +1847,11 @@ class Client:
     Store and recall memories, isolated per ``user_id``.
 
         mem = Client(api_key="wos-...")
+        mem.create_store("alice")                              # once per store
         mem.add("she prefers tea over coffee", user_id="alice")
         hits = mem.search("what does alice drink?", user_id="alice")
 
-    The API key picks *which memory* (your account). ``model`` picks *which engine*
+    The API key picks *which memory* (your workspace). ``model`` picks *which engine*
     reads it. Models on the shared pool read the same memory, so you can store
     with one and recall with another. Set a default on the client, override per call:
 
@@ -2051,7 +2058,7 @@ class Client:
 
             mem.add("moved to Berlin", user_id="alice", event_date="2026-03-01")      # when it happened
             mem.add("I promised the report by Friday", user_id="alice", speaker="me")   # the assistant's own words
-            mem.add("Bob said the deadline moved", user_id="alice", speaker="Bob")      # a person (up to 50 per store)
+            mem.add("Bob said the deadline moved", user_id="alice", speaker="Bob")      # a person registered with add_speaker (up to 50 per store)
 
         ``user_id`` is optional — omit it to use the client's default store.
 
@@ -2103,12 +2110,14 @@ class Client:
         string and never fetched). When ``reference`` is sent the service keeps no image
         bytes: ``get_image`` answers 404, and you fetch the picture from your reference.
 
-        Both edges must be 700px or more; a smaller image is refused (400).
+        Both edges must be 700px or more and the long edge at most 2500px, and the image
+        file at most 7MB; anything else is refused (400) with the reason.
 
         What we keep is NOT your original. Over 1568px on the long edge the picture is
         downscaled to 1568 on the way in, and downscaling means re-encoding: lossless
         formats are written as WebP, so a PNG comes back from ``get_image`` as
-        ``image/webp``; JPEG stays JPEG. Under 1568px the bytes are untouched.
+        ``image/webp``; JPEG stays JPEG. A re-encode that would make the file bigger is
+        dropped and your bytes kept. Under 1568px the bytes are untouched.
 
         Returns ``{"id", "status"}``. When something was saved, ``status`` starts with
         ``"stored"`` and can carry more text, so match on the prefix. It is
@@ -2191,7 +2200,8 @@ class Client:
         verify: Optional[int] = None, max_images: Optional[int] = None,
         model: Optional[str] = None, **opts: Any
     ) -> list[dict]:
-        """Search a store's memories. Returns them most relevant first.
+        """Search a store's memories. They come most relevant first; the assistant's own
+        words and image memories, when there are any, follow them in their own order.
 
         The list ARRIVES in that order — do not re-sort it. ``similarity`` on each
         memory is a raw closeness score, not the ranking key: what produces the order
@@ -2207,14 +2217,15 @@ class Client:
         ``limit`` is 5-20, and out of range is refused rather than clamped: asking for
         50 and silently receiving 20 reads as "that is all there is". The default is 10.
 
-        ``limit`` bounds ``memories``, not the returned list. The assistant's own words
-        (``self_memories``, on a model with that capability) and image memories (one
-        unless ``max_images`` says otherwise) come back in it as well, so it can hold more
-        than ``limit``. They are billed either way. Size a prompt window on the list you
+        ``limit`` bounds ``memories``, not the returned list, and each ``verify`` pass can
+        add up to ``limit`` more. The assistant's own words (``self_memories``, on a model
+        with that capability) and image memories (one unless ``max_images`` says
+        otherwise) come back after them in it as well, so it can hold more than ``limit``. They are billed either way. Size a prompt window on the list you
         get back, not on ``limit``. :meth:`search_full` hands the fields back apart.
 
-        ``filters`` chooses what is searched, not what is kept afterwards — a narrow
-        filter still returns your full ``limit`` when that many matches sit inside it::
+        ``filters`` narrows a search to part of a store. A narrow filter can return fewer
+        than ``limit`` even when the store holds more inside it. A memory stored without
+        an ``event_date`` is matched by when it was stored::
 
             mem.search("what did we decide", filters={
                 "categories": ["work"],
@@ -2236,15 +2247,18 @@ class Client:
 
         Other options, passed the same way as ``filters``:
 
-        ``cache_control`` turns on recall caching — a repeated or extended query inside
-        the TTL bills at **0.1×**::
+        ``cache_control`` turns on recall caching — the same query again inside the TTL
+        bills at **0.1×**::
 
             mem.search("what did we decide", cache_control={"ttl": "5m"})
 
         It is not free to switch on. The FIRST call writes the cache and bills the query
-        tokens at **2×** for a ``5m`` TTL and **3×** for ``1h``; only hits inside the TTL
-        get the 0.1× rate. So it pays for a query you repeat or extend and costs more for
-        one you issue once — enabling it on every search raises the bill.
+        tokens at **2×** for a ``5m`` TTL and **3×** for ``1h``. The same query again inside
+        the TTL bills its query and its results at 0.1×. A query that extends the cached one
+        (its text plus more) bills the cached part at 0.1×, the new part at the write rate
+        and its results at the normal rate. A store keeps one cached query per model and
+        set of options, so a different query replaces it. So it pays for a query you
+        repeat or extend and costs more for one you issue once — enabling it on every search raises the bill.
 
         Accepts ``{"ttl": "5m"}`` or ``{"ttl": "1h"}``; any other value is a 400. Any
         write to the store invalidates its cache at once, so a hit can never serve a
@@ -2256,9 +2270,9 @@ class Client:
         or a name registered with :meth:`add_speaker`.
 
         ``verify`` (0–3) asks again after the first answer, up to that many times, and
-        each extra pass reaches memories the earlier ones did not. No LLM runs at any
-        value. It stops early when
-        a pass finds nothing new, and ``verify_used`` in the response says how many ran.
+        each extra pass reaches memories the earlier ones did not. Raising it adds no
+        language model call. It stops early when a pass finds nothing new, and
+        ``verify_used`` in the response says how many passes added memories.
         Each pass is another engine call that can add up to ``limit`` more memories, so
         it costs more; you are billed for what is delivered. Default 0. It helps most on
         questions needing several distinct memories from far apart in the history and
@@ -2292,7 +2306,7 @@ class Client:
 
             r = mem.search_full("the day we moved", "alice", max_images=3, verify=2)
             r["images"]        # the photos, apart from the text memories
-            r["verify_used"]   # re-ask passes that actually ran (you are billed per pass)
+            r["verify_used"]   # re-ask passes that added memories (each billed for what it added)
 
         ``memories``, ``self_memories`` and ``images`` are always lists. Anything else
         the service sent comes through untouched.
@@ -2378,16 +2392,16 @@ class Client:
         return _as_records(self._post("/api/v1/memory/history", {"user_id": self._uid(user_id)}, model=model).get("turns"))
 
     def stats(self, user_id: Optional[str] = None, *, model: Optional[str] = None) -> dict:
-        """Memory counts for a store: ``{total_memories, short_term_turns}``. Omit ``user_id`` for the default."""
+        """Memory counts for a store: ``{total_memories, short_term_turns}``. Omit ``user_id`` for the default.
+
+        ``total_memories`` can be larger than the number ``list_memories`` lists."""
         return self._post("/api/v1/memory/stats", {"user_id": self._uid(user_id)}, model=model)
 
     def get(self, user_id: Optional[str] = None, memory_id: str = _NO_ID, *, model: Optional[str] = None) -> dict:
         """Fetch ONE memory by id — the text you stored, and its metadata.
 
-        The id is the one ``add``/``store`` or ``list_memories`` returned. Same
-        visibility as ``list_memories``: an id from another store, an id that
-        ``list_memories`` does not return, or an invalidated memory raises
-        ``NotFoundError``. Omit
+        The id is the one ``add``/``store`` or ``list_memories`` returned. An unknown id
+        or one from another store raises ``NotFoundError``. Omit
         ``user_id`` (keyword ``memory_id=``) for the default store.
 
             m = mem.get(memory_id="9b2d8c1e-...")
@@ -2487,9 +2501,10 @@ class Client:
             open(f"image.{ext}", "wb").write(data)
 
         This is the picture the SERVICE holds, which is not necessarily your upload —
-        in size or in format. An image whose long edge was over 1568px was downscaled to
-        1568 on the way in and re-encoded (lossless formats as WebP, so a PNG comes back
-        as ``image/webp``; JPEG stays JPEG), and that smaller picture is what is
+        in size or in format. An image whose long edge was over 1568px (2500 is the most
+        the service takes) was downscaled to 1568 on the way in and re-encoded (lossless
+        formats as WebP, so a PNG comes back as ``image/webp``; JPEG stays JPEG; kept as
+        sent when the re-encode came out bigger), and that smaller picture is what is
         stored and comes back here. Nothing on our side ever uses more than 1568, so the
         extra pixels would be bytes nobody reads. Keep your own copy if you need the
         full-resolution file.
@@ -2574,9 +2589,10 @@ class Client:
         Free: no charge and no balance gate, because an account at zero still has to be
         able to find out why. Rate-limited instead.
 
-        Scoped to THIS key: its own lifetime spend, plus its workspace and stores over
-        the window. Never another key's. ``balance_cents`` is account-wide, since that
-        is what gates the next call whichever key makes it.
+        ``key`` is THIS key's own lifetime spend. ``workspace`` and ``stores`` cover the
+        window for the workspace this key belongs to, every key in it included.
+        ``balance_cents`` is account-wide, since that is what gates the next call
+        whichever key makes it.
 
         ``stores`` is highest spend first and at most 50 rows — a longer list is cut, so the
         rows need not sum to ``workspace``. A row named ``other`` is an overflow bucket,
@@ -2651,10 +2667,13 @@ class Client:
 
     def lineage(self, user_id: Optional[str] = None, memory_id: str = _NO_ID, *,
                 model: Optional[str] = None) -> dict:
-        """The full chain of edits behind one memory, oldest first.
+        """The edits that followed one memory: from the id you pass forward to the version
+        in force, oldest first.
 
-        ``is_current`` marks the version in force. ``revisions()`` says how much a store
-        moved; this says what happened to one fact.
+        ``is_current`` marks the version in force. The chain runs forward only, so pass
+        the first version's id to see the whole history; the current version's id (what
+        ``search`` returns) comes back alone. ``revisions()`` says how much a store moved;
+        this says what happened to one fact.
         """
         user_id, memory_id = _split_id_args(user_id, memory_id)
         memory_id = _require_memory_id(memory_id, "the id that add/store or list_memories returned")
@@ -2705,7 +2724,7 @@ class Client:
         ``memory`` is ``"shared"`` (models that read the same store) or ``"isolated"``
         (a model with its own dedicated memory). ``capabilities`` says what an available
         model can do: ``{"images", "engrams", "forms", "re_ask", "self_memories",
-        "speaker_names"}``, each true or false. Needs no API key.
+        "speaker_names"}``, each true or false.
 
         ``retires_at`` (RFC3339) is present on a live model that is scheduled to retire.
         From that instant the model leaves this list and calls naming it are refused.
@@ -2786,7 +2805,9 @@ class Client:
         return _speakers_list(self._request("GET", "/api/v1/memory/speakers", params={"user_id": self._uid(user_id)}))
 
     def remove_speaker(self, speaker: str, user_id: Optional[str] = None) -> dict:
-        """Unregister a person. Their memories stay; the name tag goes."""
+        """Unregister a person. Their memories stay, and the name can no longer tag a new
+        memory or filter a search. The tag goes from stored memories too, except on
+        ``tablet-2``, which keeps it on memories already stored with it."""
         return self._request(
             "DELETE", "/api/v1/memory/speakers", json_body={"user_id": self._uid(user_id), "speaker": speaker}
         )
@@ -3303,7 +3324,8 @@ class AsyncClient:
         verify: Optional[int] = None, max_images: Optional[int] = None,
         model: Optional[str] = None, **opts: Any
     ) -> list[dict]:
-        """Search a store's memories. Returns them most relevant first.
+        """Search a store's memories. They come most relevant first; the assistant's own
+        words and image memories, when there are any, follow them in their own order.
 
         The list ARRIVES in that order — do not re-sort it. ``similarity`` on each
         memory is a raw closeness score, not the ranking key: what produces the order
@@ -3376,13 +3398,13 @@ class AsyncClient:
         return _as_records((await self._post("/api/v1/memory/history", {"user_id": self._uid(user_id)}, model=model)).get("turns"))
 
     async def stats(self, user_id: Optional[str] = None, *, model: Optional[str] = None) -> dict:
-        """Memory counts for a store: ``{total_memories, short_term_turns}``."""
+        """Memory counts for a store: ``{total_memories, short_term_turns}``.
+        ``total_memories`` can be larger than the number ``list_memories`` lists."""
         return await self._post("/api/v1/memory/stats", {"user_id": self._uid(user_id)}, model=model)
 
     async def get(self, user_id: Optional[str] = None, memory_id: str = _NO_ID, *, model: Optional[str] = None) -> dict:
         """Fetch ONE memory by id — the text you stored, and its metadata.
-        Same visibility as ``list_memories``: an unknown id, one from another store, or
-        one ``list_memories`` does not return raises ``NotFoundError``."""
+        An unknown id or one from another store raises ``NotFoundError``."""
         user_id, memory_id = _split_id_args(user_id, memory_id)
         # A blank id is refused and a valid one is stripped, as in the sibling calls.
         if not isinstance(memory_id, str) or not memory_id.strip():
@@ -3449,8 +3471,9 @@ class AsyncClient:
                         model: Optional[str] = None) -> tuple[bytes, str]:
         """Fetch the bytes of an image memory → ``(bytes, content_type)``.
 
-        This is the picture the SERVICE holds: anything over 1568px on its long edge was
-        downscaled on the way in, and re-encoded to WebP unless it was a JPEG. Name the
+        This is the picture the SERVICE holds: anything over 1568px on its long edge (2500
+        at most) was downscaled on the way in, and re-encoded to WebP unless it was a JPEG
+        or the re-encode came out bigger. Name the
         file from ``content_type``, not from what you uploaded. An image stored with a
         ``reference`` has no bytes here (``NotFoundError``). See ``Client.get_image``."""
         user_id, memory_id = _split_id_args(user_id, memory_id)
@@ -3518,9 +3541,10 @@ class AsyncClient:
         Free: no charge and no balance gate, because an account at zero still has to be
         able to find out why. Rate-limited instead.
 
-        Scoped to THIS key: its own lifetime spend, plus its workspace and stores over
-        the window. Never another key's. ``balance_cents`` is account-wide, since that
-        is what gates the next call whichever key makes it.
+        ``key`` is THIS key's own lifetime spend. ``workspace`` and ``stores`` cover the
+        window for the workspace this key belongs to, every key in it included.
+        ``balance_cents`` is account-wide, since that is what gates the next call
+        whichever key makes it.
 
         ``stores`` is highest spend first and at most 50 rows — a longer list is cut, so the
         rows need not sum to ``workspace``. A row named ``other`` is an overflow bucket,
@@ -3558,7 +3582,8 @@ class AsyncClient:
 
     async def lineage(self, user_id: Optional[str] = None, memory_id: str = _NO_ID, *,
                       model: Optional[str] = None) -> dict:
-        """The full chain of edits behind one memory, oldest first. See ``Client.lineage``."""
+        """The edits that followed one memory, from the id you pass forward, oldest first.
+        See ``Client.lineage``."""
         user_id, memory_id = _split_id_args(user_id, memory_id)
         memory_id = _require_memory_id(memory_id, "the id that add/store or list_memories returned")
         return await self._post(
@@ -3606,8 +3631,7 @@ class AsyncClient:
         return out
 
     async def list_models(self) -> list[dict]:
-        """Available models, each with its ``capabilities``. Needs no API key. See
-        ``Client.list_models``."""
+        """Available models, each with its ``capabilities``. See ``Client.list_models``."""
         return _as_records((await self._request("GET", "/api/v1/models")).get("models"))
 
     async def create_store(self, user_id: Optional[str] = None) -> dict:
@@ -3638,7 +3662,9 @@ class AsyncClient:
         return _speakers_list(await self._request("GET", "/api/v1/memory/speakers", params={"user_id": self._uid(user_id)}))
 
     async def remove_speaker(self, speaker: str, user_id: Optional[str] = None) -> dict:
-        """Unregister a person. Their memories stay; the name tag goes."""
+        """Unregister a person. Their memories stay, and the name can no longer tag a new
+        memory or filter a search. The tag goes from stored memories too, except on
+        ``tablet-2``, which keeps it on memories already stored with it."""
         return await self._request(
             "DELETE", "/api/v1/memory/speakers", json_body={"user_id": self._uid(user_id), "speaker": speaker}
         )

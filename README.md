@@ -24,8 +24,8 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 ## Why
 
 - **The same in every language** — identical recall whichever language a memory was written in (Korean · Japanese · Chinese · English).
-- **No LLM in the loop** — `store` / `search` / `recall` never call a language model. You pay retrieval, not generation.
-- **Bounded retrieval** — `recall()` returns a small, fixed-size slice regardless of how much you've stored (~1,000 tokens on `tablet-2`, the default engine). Your LLM bill stops growing with history.
+- **No LLM reads your memories** — no language model reads your stored memories, on any model. You pay retrieval, not generation.
+- **Bounded retrieval** — `recall()` returns the recent turns, at most `limit` long-term memories (default 10, up to 20) and at most `context_limit` rows of the surrounding conversation (default 10, up to 20), however much you've stored. Your LLM bill stops growing with history.
 
 ## Methods
 
@@ -46,9 +46,9 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 | `delete_all(user_id)` | GDPR erase (delete every memory for the user) |
 | `add_speaker(speaker, user_id?)` | Register a person (explicit, up to 50 to start) |
 | `list_speakers(user_id?)` | Registered people + per-person memory counts |
-| `remove_speaker(speaker, user_id?)` | Unregister; memories stay, the tag goes |
+| `remove_speaker(speaker, user_id?)` | Unregister; memories stay. The tag goes, except on `tablet-2`, which keeps it on memories already stored |
 
-All methods take a `user_id` — it names the **store**: one isolated memory space per end-user, agent, or topic, then per account (your API key). WHO said each memory inside a store is the `speaker` tag below — storing the assistant's own words never needs a separate id.
+All methods take a `user_id` — it names the **store**: one isolated memory space per end-user, agent, or topic, then per workspace (your API key's). WHO said each memory inside a store is the `speaker` tag below — storing the assistant's own words never needs a separate id.
 
 ## Who said it (speakers)
 
@@ -64,7 +64,8 @@ mem.add("Bob said the deadline moved to Tuesday", user_id="alice", speaker="Bob"
 mem.search("what did Bob say about deadlines?", user_id="alice", speaker="Bob")
 ```
 
-Results arrive best-first — take the list in the order given. ``similarity`` on each
+Memories arrive best-first, and the assistant's own words and image memories, when there
+are any, follow them in their own order. Take the list in the order given. ``similarity`` on each
 memory is a raw closeness score, not the ranking key: what produces the order is
 internal and is not returned, so sorting by it makes results worse. There is no
 ``score`` field.
@@ -98,13 +99,16 @@ and semantics (retries, redirect refusal, guards). Close it with `async with` or
 
 ## Recall caching
 
-Opt in per search and repeated or extended queries reuse the previous result
-at 10% of the normal rate (Tablet and Scroll models).
+Opt in per search and a repeated query reuses the previous result at 10% of the
+normal rate; an extended one reuses part of it (Tablet and Scroll models).
 
 It is not free to turn on: the FIRST call writes the cache and bills the query
-tokens at 2x for a `5m` TTL, 3x for `1h`. Only hits inside the TTL bill at 0.1x.
-So it pays for a query you repeat or extend, and costs more for one you issue
-once — do not switch it on globally. Any write to the store invalidates its cache
+tokens at 2x for a `5m` TTL, 3x for `1h`. The same query again inside the TTL bills
+its query and its results at 0.1x. A query that extends the cached one (its text plus
+more) bills the cached part at 0.1x, the new part at the write rate and its results
+at the normal rate. A store keeps one cached query per model and set of options, so a
+different query replaces it. So it pays for a query you repeat or extend, and costs
+more for one you issue once — do not switch it on globally. Any write to the store invalidates its cache
 at once, so a hit can never predate a new memory.
 
 ```python
@@ -118,11 +122,12 @@ Built in, no configuration needed:
 
 - **Automatic retries** — 429 and a 409 for a write already in flight always, and 408 /
   502 / 503 / 504 or a connection error only when a retry cannot double-process a write.
-  The writes and the searches are POSTs, and any of those four may have been returned
-  *after* the write already landed, so those get 429, that 409 and connect-level
-  failures only. The GET and DELETE calls — `ping`, `list_stores`, `list_speakers`,
+  A write may already have landed when any of those four comes back, so a POST write gets
+  429, that 409 and connect-level failures only. The calls that are safe to send again
+  retry all four: the reads sent as POST (`search`, `recall`, `get`, `list_memories`,
+  `stats`, ...) and the GET and DELETE calls (`ping`, `list_stores`, `list_speakers`,
   `list_models`, `list_engrams`, `usage`, `delete_store`, `remove_speaker`,
-  `forget_image` — retry all four. Twice, with exponential backoff + jitter, honoring
+  `forget_image`). Twice, with exponential backoff + jitter, honoring
   the server's `Retry-After` up to 30s. Tune with `Client(retries=...)`; `retries=0`
   disables.
 - **Redirects refused** — the API key never follows a 3xx to another host.
