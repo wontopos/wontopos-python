@@ -622,13 +622,51 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(b2["form"], "memoir")
 
     def test_post_write_not_retried_on_5xx(self):
-        # A 502 on a POST write must NOT retry: the write may already have landed,
-        # and a retry would store it twice. Only one request should be made.
+        # A 502 on a POST write without a key must NOT retry: the write may already have
+        # landed, and a retry would apply it twice. Only one request should be made.
         srv, mem = self.make([(502, {}, '{"error": "bad gateway"}')])
         with self.assertRaises(WosError) as cm:
-            mem.add("hello", user_id="u")
+            mem.create_store("u")
         self.assertEqual(cm.exception.status, 502)
-        self.assertEqual(len(srv.seen), 1)  # no retry on a non-idempotent write
+        self.assertEqual(len(srv.seen), 1)  # no retry on a write the service cannot de-duplicate
+        self.assertIsNone(srv.seen[0]["headers"].get("Idempotency-Key"))
+
+    def test_memory_write_retried_on_5xx_under_one_key(self):
+        # A memory write carries a key, so the service answers a repeat with the first
+        # attempt's result: sending it again cannot store it twice.
+        srv, mem = self.make([
+            (502, {"Retry-After": "0"}, '{"error": "bad gateway"}'),
+            (200, {}, '{"id": "m1", "status": "stored"}'),
+        ])
+        r = mem.add("hello", user_id="u")
+        self.assertEqual(r["id"], "m1")
+        self.assertEqual(len(srv.seen), 2)
+        k = srv.seen[0]["headers"].get("Idempotency-Key")
+        self.assertRegex(k, r"\Asdk-[0-9a-f]{32}\Z")
+        self.assertEqual(srv.seen[1]["headers"].get("Idempotency-Key"), k,
+                         "a retry must repeat the key, or it is a second write")
+        self.assertEqual(srv.seen[1]["body"], srv.seen[0]["body"])
+
+    def test_each_memory_write_gets_a_key_of_its_own(self):
+        srv, mem = self.make([(200, {}, '{"id": "m", "status": "stored"}')] * 4)
+        mem.add("same text", "u")
+        mem.add("same text", "u")
+        mem.add_turn("hi", "yo", "u")
+        mem.update("m1", "new", "u")
+        keys = [r["headers"].get("Idempotency-Key") for r in srv.seen]
+        for k in keys:
+            self.assertRegex(k, r"\Asdk-[0-9a-f]{32}\Z")
+        self.assertEqual(len(set(keys)), 4)
+
+    def test_a_replay_of_the_clients_own_retry_is_not_reported(self):
+        # One call that stored once: `replayed` would tell the caller it did not.
+        srv, mem = self.make([
+            (503, {"Retry-After": "0"}, "{}"),
+            (200, {"Idempotent-Replayed": "true"}, '{"id": "m1", "status": "stored"}'),
+        ])
+        r = mem.add("x", "alice")
+        self.assertEqual(len(srv.seen), 2)
+        self.assertNotIn("replayed", r)
 
     def test_get_retried_on_503(self):
         # 503 on an idempotent GET (/models) is safe to retry.
@@ -680,9 +718,9 @@ class ClientTests(unittest.TestCase):
             with self.subTest(status=status):
                 srv, mem = self.make([(status, {}, '{"error": "gateway"}')])
                 with self.assertRaises(WosError) as cm:
-                    mem.add("hello", user_id="u")
+                    mem.add_speaker("Bob", "u")
                 self.assertEqual(cm.exception.status, status)
-                self.assertEqual(len(srv.seen), 1, f"{status} retried a write")
+                self.assertEqual(len(srv.seen), 1, f"{status} retried a write without a key")
 
     def test_backoff_parses_http_date_retry_after(self):
         from email.utils import formatdate
@@ -740,13 +778,20 @@ class ClientTests(unittest.TestCase):
 
     def test_post_not_retried_on_midstream_drop(self):
         # The server accepts, reads the request, then drops the connection with
-        # no response. For a POST the write may already have landed — the client
-        # must NOT fire it again.
+        # no response. For a POST without a key the write may already have landed —
+        # the client must NOT fire it again.
         accepted, base = dropping_server([None, None])
         mem = Client("wos-test-xxxxxxxxxx", base_url=base, retries=1)
         with self.assertRaises(wontopos.APIConnectionError):
-            mem.add("hello", user_id="u")
+            mem.create_store("u")
         self.assertEqual(len(accepted), 1)  # exactly one attempt
+
+    def test_memory_write_retried_on_midstream_drop(self):
+        # A memory write carries a key, so the same drop is sent again.
+        accepted, base = dropping_server([None, '{"id": "m1", "status": "stored"}'])
+        mem = Client("wos-test-xxxxxxxxxx", base_url=base, retries=1)
+        self.assertEqual(mem.add("hello", user_id="u")["id"], "m1")
+        self.assertEqual(len(accepted), 2)
 
     def test_get_retried_on_midstream_drop(self):
         # The same drop on an idempotent GET is safe to retry.
@@ -1326,7 +1371,8 @@ class IdempotencyKeyTest(unittest.TestCase):
         mem.update("m1", "new", "alice", idempotency_key="k4")
         mem.add("x", "alice")
         got = [r["headers"].get("Idempotency-Key") for r in srv.seen]
-        self.assertEqual(got, ["k1", "k2", "k3", "k4", None])
+        self.assertEqual(got[:4], ["k1", "k2", "k3", "k4"])
+        self.assertRegex(got[4], r"\Asdk-[0-9a-f]{32}\Z")
 
     def test_a_trailing_newline_is_refused_here_not_by_http_client(self):
         # Python's `$` also matches just BEFORE a trailing newline, so `.match()` would
@@ -1748,12 +1794,19 @@ class BodyDropRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(accepted), 2, "the dropped body was not retried")
 
     def test_sync_does_not_retry_a_write_after_the_body_drops(self):
-        # The write may already have landed — replaying it stores twice.
-        accepted, base = dropping_server(["TRUNCATE", '{"id": "m1"}'])
+        # A write without a key may already have landed — replaying it applies it twice.
+        accepted, base = dropping_server(["TRUNCATE", '{"status": "created"}'])
         mem = Client("wos-test-xxxxxxxxxx", user_id="u", base_url=base, retries=2)
         with self.assertRaises(APIConnectionError):
-            mem.add("hello")
-        self.assertEqual(len(accepted), 1, "a write was retried")
+            mem.create_store()
+        self.assertEqual(len(accepted), 1, "a write without a key was retried")
+
+    def test_sync_retries_a_memory_write_after_the_body_drops(self):
+        # A memory write carries a key: the repeat is answered with the first result.
+        accepted, base = dropping_server(["TRUNCATE", '{"id": "m1"}'])
+        mem = Client("wos-test-xxxxxxxxxx", user_id="u", base_url=base, retries=2)
+        self.assertEqual(mem.add("hello")["id"], "m1")
+        self.assertEqual(len(accepted), 2)
 
     @needs_httpx
     async def test_async_agrees_with_sync_on_both(self):
@@ -1762,11 +1815,16 @@ class BodyDropRetryTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await mem.list_stores(), [])
         self.assertEqual(len(accepted), 2)
 
-        accepted2, base2 = dropping_server(["TRUNCATE", '{"id": "m1"}'])
+        accepted2, base2 = dropping_server(["TRUNCATE", '{"status": "created"}'])
         async with AsyncClient("wos-test-xxxxxxxxxx", user_id="u", base_url=base2, retries=2) as mem:
             with self.assertRaises(APIConnectionError):
-                await mem.add("hello")
+                await mem.create_store()
         self.assertEqual(len(accepted2), 1)
+
+        accepted3, base3 = dropping_server(["TRUNCATE", '{"id": "m1"}'])
+        async with AsyncClient("wos-test-xxxxxxxxxx", user_id="u", base_url=base3, retries=2) as mem:
+            self.assertEqual((await mem.add("hello"))["id"], "m1")
+        self.assertEqual(len(accepted3), 2)
 
 
 class SyncAsyncDropParityTest(unittest.IsolatedAsyncioTestCase):
@@ -1795,15 +1853,25 @@ class SyncAsyncDropParityTest(unittest.IsolatedAsyncioTestCase):
 
     @needs_httpx
     async def test_async_does_not_retry_a_write_on_mid_stream_drop(self):
-        """Aligning idempotent retries must not open writes — the first attempt may already have landed."""
-        accepted, base = dropping_server([None, '{"id": "m1"}'])
+        """Aligning idempotent retries must not open writes without a key — the first attempt may already have landed."""
+        accepted, base = dropping_server([None, '{"status": "created"}'])
         mem = AsyncClient("wos-test-xxxxxxxxxx", base_url=base, retries=2)
         try:
             with self.assertRaises(APIConnectionError):
-                await mem.add("x", "alice")
+                await mem.create_store("alice")
         finally:
             await mem.aclose()
-        self.assertEqual(len(accepted), 1, "retrying a POST can store the same memory twice")
+        self.assertEqual(len(accepted), 1, "retrying a POST without a key can apply it twice")
+
+    @needs_httpx
+    async def test_async_retries_a_memory_write_on_mid_stream_drop(self):
+        accepted, base = dropping_server([None, '{"id": "m1"}'])
+        mem = AsyncClient("wos-test-xxxxxxxxxx", base_url=base, retries=2)
+        try:
+            self.assertEqual((await mem.add("x", "alice"))["id"], "m1")
+        finally:
+            await mem.aclose()
+        self.assertEqual(len(accepted), 2)
 
 
 class ErrorStatusOutranksTheDeadBodyTest(unittest.IsolatedAsyncioTestCase):
@@ -2923,7 +2991,7 @@ class ErrorFieldsTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
         _, mem = self.make([(502, {}, ""), (500, {}, "  \r\n")])
         for status in (502, 500):
             with self.assertRaises(WosError) as cm:
-                mem.add("x", "alice")
+                mem.create_store("alice")
             self.assertEqual(cm.exception.message, f"HTTP {status}")
             self.assertEqual(str(cm.exception), f"[{status}] HTTP {status}")
 
@@ -2931,7 +2999,7 @@ class ErrorFieldsTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
         _, mem = self.amake([(502, {}, "")])
         async with mem:
             with self.assertRaises(wontopos.ServerError) as cm:
-                await mem.add("x", "alice")
+                await mem.create_store("alice")
         self.assertEqual(cm.exception.message, "HTTP 502")
 
     def test_details_lose_control_characters(self):
@@ -3930,7 +3998,7 @@ class NoAsyncioLoopTest(AsyncMake, unittest.IsolatedAsyncioTestCase):
 
 class ReadPostRetryTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
     """search and recall go as POST and were retried by method only: a 503 a GET would
-    have retried reached the caller. A write still is not sent again."""
+    have retried reached the caller. A write without a key still is not sent again."""
 
     BUSY = (503, {"Retry-After": "0"}, b"{}")
 
@@ -3939,9 +4007,9 @@ class ReadPostRetryTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
             srv, mem = self.make([(status, {"Retry-After": "0"}, b"{}"), (200, {}, b'{"memories":[]}')])
             mem.search("q", "alice")
             self.assertEqual(len(srv.seen), 2, status)
-        srv, mem = self.make([self.BUSY, (200, {}, b'{"id":"m1","status":"stored"}')])
+        srv, mem = self.make([self.BUSY, (200, {}, b'{"status":"created"}')])
         with self.assertRaises(wontopos.ServerError):
-            mem.add("x", "alice")
+            mem.create_store("alice")
         self.assertEqual(len(srv.seen), 1)
 
     async def test_async(self):
@@ -3953,7 +4021,8 @@ class ReadPostRetryTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
 
 class UndecodableBodyTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
     """A 2xx body that cannot be decoded is a transport failure, APIConnectionError with
-    status 0, in both clients: a read is retried and a write is not."""
+    status 0, in both clients: a read is retried, and so is a memory write, which carries a
+    key; a write without one is not."""
 
     BAD_GZIP = (200, {"Content-Encoding": "gzip"}, b"this is not gzip")
     BAD_DEFLATE = (200, {"Content-Encoding": "deflate"}, b"\xff\xff not deflate either")
@@ -3971,8 +4040,12 @@ class UndecodableBodyTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(len(srv.seen), 2)
         srv, mem = self.make([self.BAD_GZIP] * 2, retries=1)
         with self.assertRaises(APIConnectionError):
-            mem.add("x", "alice")
+            mem.create_store("alice")
         self.assertEqual(len(srv.seen), 1)
+        srv, mem = self.make([self.BAD_GZIP] * 2, retries=1)
+        with self.assertRaises(APIConnectionError):
+            mem.add("x", "alice")
+        self.assertEqual(len(srv.seen), 2)
 
     async def test_async(self):
         for bad in (self.BAD_GZIP, self.BAD_DEFLATE):
@@ -3992,14 +4065,96 @@ class UndecodableBodyTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase)
                 srv, mem = self.amake([bad] * 2, retries=1)
                 async with mem:
                     with self.assertRaises(APIConnectionError):
-                        await mem.add("x", "alice")
+                        await mem.create_store("alice")
                 self.assertEqual(len(srv.seen), 1)
+                srv, mem = self.amake([bad] * 2, retries=1)
+                async with mem:
+                    with self.assertRaises(APIConnectionError):
+                        await mem.add("x", "alice")
+                self.assertEqual(len(srv.seen), 2)
 
     async def test_async_error_status_still_stands(self):
         _, mem = self.amake([(404, {"Content-Encoding": "gzip"}, b"not gzip")])
         async with mem:
             with self.assertRaises(NotFoundError):
                 await mem.stats("alice")
+
+
+class RetirementWarningTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
+    """A model's retirement is said before the day: the service names it in a Sunset
+    header, and the client warns once per model and day."""
+
+    SUNSET = {"Sunset": "Sat, 07 Nov 2026 00:00:00 GMT"}
+
+    def setUp(self):
+        wontopos._reset_warning_state()
+        self.addCleanup(wontopos._reset_warning_state)
+
+    def test_once_per_model_and_day(self):
+        srv, mem = self.make([(200, self.SUNSET, '{"memories": []}')] * 2
+                             + [(200, {"Sunset": "Sun, 08 Nov 2026 00:00:00 GMT"}, '{"memories": []}')],
+                             model="scroll-1")
+        with self.assertLogs("wontopos", level="WARNING") as logs:
+            mem.search("q", "alice")
+            mem.search("q", "alice")
+        said = [r.getMessage() for r in logs.records]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn('"scroll-1" retires on 2026-11-07', said[0])
+        self.assertIn("410", said[0])
+        with self.assertLogs("wontopos", level="WARNING") as logs:
+            mem.search("q", "alice")
+        self.assertEqual(len(logs.records), 1, "a new day is news")
+
+    def test_no_header_or_not_a_date_says_nothing(self):
+        srv, mem = self.make([(200, {}, '{"memories": []}'), (200, {"Sunset": "soon"}, '{"memories": []}')])
+        # The module's own 3.9-safe helper: assertNoLogs is 3.10+.
+        with no_wontopos_warning(self):
+            mem.search("q", "alice")
+            mem.search("q", "alice")
+
+    def test_a_per_call_model_is_the_one_named(self):
+        srv, mem = self.make([(200, self.SUNSET, '{"memories": []}')])
+        with self.assertLogs("wontopos", level="WARNING") as logs:
+            mem.search("q", "alice", model="scroll-1")
+        self.assertIn('"scroll-1"', logs.records[0].getMessage())
+
+    async def test_async(self):
+        srv, mem = self.amake([(200, self.SUNSET, b'{"memories": []}')], model="scroll-1")
+        async with mem:
+            with self.assertLogs("wontopos", level="WARNING") as logs:
+                await mem.search("q", "alice")
+        self.assertIn('"scroll-1" retires on 2026-11-07', logs.records[0].getMessage())
+
+
+class RecallShapeTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
+    """recall hands back its lists as documented: a row of another kind is dropped, as
+    history drops it, and every other field is kept."""
+
+    BODY = json.dumps({
+        "short_term": {"turns": [{"role": "user", "content": "hi"}, "not a turn", None], "count": 3},
+        "long_term": {"memories": [{"id": "m1", "content": "tea"}, 7], "count": 2},
+        "context": {"around_top_memory": ["[before] a", 3, {"x": 1}, "[match] b"], "count": 4},
+        "instruction": "kept",
+    })
+
+    def check(self, r):
+        self.assertEqual(r["short_term"]["turns"], [{"role": "user", "content": "hi"}])
+        self.assertEqual(r["long_term"]["memories"], [{"id": "m1", "content": "tea"}])
+        self.assertEqual(r["context"]["around_top_memory"], ["[before] a", "[match] b"])
+        self.assertEqual(r["short_term"]["count"], 3)
+        self.assertEqual(r["instruction"], "kept")
+
+    def test_sync(self):
+        _, mem = self.make([(200, {}, self.BODY), (200, {}, "{}")])
+        self.check(mem.recall("q", "alice"))
+        empty = mem.recall("q", "alice")
+        self.assertEqual([empty["short_term"]["turns"], empty["long_term"]["memories"],
+                          empty["context"]["around_top_memory"]], [[], [], []])
+
+    async def test_async(self):
+        _, mem = self.amake([(200, {}, self.BODY)])
+        async with mem:
+            self.check(await mem.recall("q", "alice"))
 
 
 # Must stay LAST. It sat at line 947 of a 1,624-line file, so `python tests/test_client.py`

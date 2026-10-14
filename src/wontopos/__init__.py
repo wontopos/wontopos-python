@@ -38,7 +38,8 @@ recall with another. Set a default on the client, override per call:
 Reliability: every call retries transient failures with exponential backoff +
 jitter, honoring ``Retry-After`` up to 30s — 429 and a 409 for a write already in
 flight on every call; 408/502/503/504 and connection errors only when a retry cannot
-apply a write twice (reads, the DELETE calls, or a failure at connect time). ``timeout=``
+apply a write twice (reads, the DELETE calls, the memory writes, which carry an
+idempotency key, or a failure at connect time). ``timeout=``
 bounds each attempt and ``deadline=`` the whole call, in wall-clock time. Tune with
 ``Client(retries=...)`` (0 disables), or per call site via the ``with_timeout()`` /
 ``with_retries()`` / ``with_deadline()`` clones.
@@ -82,7 +83,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.46"
+__version__ = "2.2.47"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -121,7 +122,8 @@ if os.environ.get("WONTOPOS_LOG", "").lower() == "debug":  # opt-in, like OPENAI
 # 429 is refused before the request is processed, so nothing was stored and any
 # method may retry. 502/503 are ambiguous for a write — they can arrive after the
 # write was applied, and a retried POST would store it twice. Those retry only
-# for idempotent methods.
+# for a call that is safe to send again: one that only reads, or a write with an
+# idempotency key, which the service answers with the first attempt's result.
 _RETRY_ALWAYS = (429,)
 # 504 carries the same ambiguity as 502/503. 408 is listed here rather than in
 # _RETRY_ALWAYS: RFC 7231 says the server never got a complete request, but an
@@ -534,6 +536,7 @@ def _reset_warning_state() -> None:
     _warned_store_ids.clear()
     _warned_filter_keys.clear()
     _warned_metadata_keys.clear()
+    _warned_retirements.clear()
 
 
 def _normalize_image(image: Any) -> dict:
@@ -669,6 +672,20 @@ def _as_records(x: Any) -> list:
     records, so one bad element never poisons the batch (and never destroys it —
     the whole array staying usable is the point)."""
     return [m for m in _as_list(x) if isinstance(m, dict)]
+
+
+def _recall_shape(r: Any) -> dict:
+    """``recall``'s answer with its three lists as documented: turns and memories that are
+    dicts, rows around the best memory that are strings. A row of any other kind is
+    dropped, as ``history`` drops it. Every other field is kept as it arrived."""
+    out = dict(r) if isinstance(r, dict) else {}
+    for part, key in (("short_term", "turns"), ("long_term", "memories"), ("context", "around_top_memory")):
+        p = out.get(part)
+        p = dict(p) if isinstance(p, dict) else {}
+        rows = _as_list(p.get(key))
+        p[key] = [x for x in rows if isinstance(x, str)] if part == "context" else _as_records(rows)
+        out[part] = p
+    return out
 
 
 # get()/delete() take the STORE first, unlike every payload-first method on this
@@ -1123,6 +1140,19 @@ _HTTP_DATE_RE = re.compile(
 )
 
 
+def _parse_http_date(v: str) -> Optional[datetime]:
+    """An HTTP-date (RFC 9110) as an aware datetime, or None when ``v`` is not one."""
+    if not _HTTP_DATE_RE.fullmatch(v):
+        return None
+    try:
+        dt = parsedate_to_datetime(v)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def _parse_retry_after(value: Any) -> Optional[float]:
     """The wait a ``Retry-After`` header asks for, in seconds. None when it is missing or
     is neither delta-seconds nor an HTTP-date."""
@@ -1133,17 +1163,47 @@ def _parse_retry_after(value: Any) -> Optional[float]:
         # Past 10 digits the value is over the cap anyway, and int() refuses very long ones.
         digits = v.lstrip("0") or "0"
         return float(2**31) if len(digits) > 10 else float(min(int(digits), 2**31))
-    if not _HTTP_DATE_RE.fullmatch(v):
-        return None
-    try:
-        dt = parsedate_to_datetime(v)
-    except (TypeError, ValueError, IndexError, OverflowError):
-        return None
+    dt = _parse_http_date(v)
     if dt is None:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
     return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+
+
+#: Retirements already announced, as ``(model, day)``, so each is said once per process.
+_warned_retirements: set = set()
+#: Past this many, no more are said: a server that sends a new date on every answer would
+#: otherwise grow the set, and the log, without end.
+_WARNED_RETIREMENTS_MAX = 64
+
+
+def _warn_if_retiring(model: Optional[str], headers: Any) -> None:
+    """The service names the day a model retires in a ``Sunset`` header (RFC 8594) on the
+    answers that model serves. Said once per model and day: without it the first sign is
+    the 410 on the day, and a line on every call would be noise."""
+    value = headers.get("Sunset") if headers is not None else None
+    if not isinstance(value, str) or not value.strip():
+        return
+    dt = _parse_http_date(value.strip())
+    if dt is None:
+        return
+    day = dt.astimezone(timezone.utc).date().isoformat()
+    key = (model or "", day)
+    # Same lock as the other process-global warn sets: unlocked, two threads both warn.
+    with _warn_lock:
+        if key in _warned_retirements or len(_warned_retirements) >= _WARNED_RETIREMENTS_MAX:
+            return
+        _warned_retirements.add(key)
+    which = f'model "{model}"' if model else "the model this client uses"
+    logging.getLogger("wontopos").warning(
+        "%s retires on %s (UTC). From then on its calls answer 410, except delete_store. "
+        "list_models() lists the models you can move to.",
+        which, day,
+    )
+
+
+def _new_idempotency_key() -> str:
+    """A key for a write that came without one: ``sdk-`` and 32 random hex digits."""
+    return f"sdk-{os.urandom(16).hex()}"
 
 
 def _backoff(attempt: int, retry_after: Optional[str] = None) -> float:
@@ -1168,14 +1228,15 @@ def _lock_wait(err: "WosError") -> Optional[float]:
     return ms / 1000.0
 
 
-def _retry_wait(status: int, reads: bool, retry_after: Optional[str], err: Optional["WosError"],
+def _retry_wait(status: int, safe: bool, retry_after: Optional[str], err: Optional["WosError"],
                 attempt: int) -> Optional[float]:
     """Seconds to wait before retrying this response, or None when it is final.
 
     A 429, and a 409 for a write already in flight, are answered before anything is
-    stored, so every method retries them. 408/502/503/504 retry only a call that only
-    reads (``reads``: an idempotent method, or a POST in ``_READ_POSTS``): a write may
-    already have been applied. A wait over 30s is final.
+    stored, so every method retries them. 408/502/503/504 retry only a call that is safe
+    to send again (``safe``: an idempotent method, a POST in ``_READ_POSTS``, or a write
+    with an idempotency key): any other write may already have been applied. A wait over
+    30s is final.
     """
     if status == 409:
         wait = _lock_wait(err)
@@ -1183,7 +1244,7 @@ def _retry_wait(status: int, reads: bool, retry_after: Optional[str], err: Optio
             return None
         return max(wait, _backoff(attempt))
     if status in _RETRY_ALWAYS or (
-        status in _RETRY_IF_IDEMPOTENT and reads
+        status in _RETRY_IF_IDEMPOTENT and safe
     ):
         ra = _parse_retry_after(retry_after)
         if ra is None:
@@ -1389,11 +1450,14 @@ class NotFoundError(WosError):
 
 
 class ConflictError(WosError):
-    """409: another write to this store was in flight (retried automatically; nothing was
-    stored), or the store id collides with an existing one (not retried).
+    """409: another write to this store was in flight, or the first request under this
+    write's idempotency key is still running (both retried automatically; nothing was
+    stored); the store id collides with an existing one (not retried); or the first request
+    under the key did not come back with an answer, so whether it was stored is not known
+    (not retried: check before sending it again under a new key).
 
-    ``conflicts_with`` names the existing store in the second case, and is ``None``
-    otherwise."""
+    ``conflicts_with`` is the existing store id this one collides with. It is set only on
+    a collision, which retrying cannot fix, and is ``None`` otherwise."""
 
     @property
     def conflicts_with(self) -> Optional[str]:
@@ -1585,7 +1649,7 @@ class _Call:
     call."""
 
     def __init__(self, method: str, path: str, retries: int, deadline: Optional[float], *,
-                 removes: Optional[bool] = None, reads: bool = False):
+                 removes: Optional[bool] = None, reads: bool = False, keyed: bool = False):
         self.method = method.upper()
         # The query string stays out of logs and errors: it can carry a store id.
         self.where = f"{method} {path.split('?', 1)[0]}"
@@ -1601,6 +1665,12 @@ class _Call:
         # method only, so search and recall were never retried.
         self.reads = (reads or self.method in _IDEMPOTENT_METHODS
                       or (self.method == "POST" and path.split("?", 1)[0] in _READ_POSTS))
+        # A write with an idempotency key is safe to send again too: the service answers
+        # a repeat with the first attempt's result, and one that arrives while the first
+        # is still running with a 409 to wait. Every memory write carries one. Only
+        # `reads` decides what a deadline that cuts a retry short reports: a keyed write
+        # may still have been applied by the attempt the deadline cut.
+        self.replay_safe = self.reads or keyed
         # Set once a retry follows an answer that may have come after the request was
         # applied: 408/502/503/504, or a connection that broke after sending.
         self.maybe_applied = False
@@ -1631,7 +1701,7 @@ class _Call:
         decided by its body, so never."""
         if status == 409 or not self._more():
             return False
-        wait = _retry_wait(status, self.reads, headers.get("Retry-After"), None, self.attempt)
+        wait = _retry_wait(status, self.replay_safe, headers.get("Retry-After"), None, self.attempt)
         return wait is not None and self._fits(wait)
 
     def after_failure(self, f: _Failure, clock: _Clock) -> float:
@@ -1642,9 +1712,9 @@ class _Call:
             if clock.by_deadline and previous is not None and self.reads:
                 raise self._final(previous)
             raise clock.error()
-        # Retry only when it cannot apply a write twice: a call that only reads, or a
-        # failure while connecting, before the request left.
-        retryable = f.never_sent or (f.dropped and self.reads)
+        # Retry only when it cannot apply a write twice: a call that only reads, a write
+        # with an idempotency key, or a failure while connecting, before the request left.
+        retryable = f.never_sent or (f.dropped and self.replay_safe)
         wait = _backoff(self.attempt)
         if retryable and (self._more() or self._spent()) and not self._fits(wait):
             # The deadline, not the retry count, ends the call, and this attempt got no
@@ -1672,7 +1742,7 @@ class _Call:
         retry_after = headers.get("Retry-After")
         if isinstance(err, RateLimitError):
             err.retry_after = _parse_retry_after(retry_after)
-        wait = _retry_wait(status, self.reads, retry_after, err, self.attempt)
+        wait = _retry_wait(status, self.replay_safe, retry_after, err, self.attempt)
         # A wait that does not fit the deadline ends the call with this response's error.
         if wait is None or not self._more() or not self._fits(wait):
             raise self._final(err)
@@ -2072,16 +2142,23 @@ class Client:
         it as ``metadata=``. A key that names a store (``userId``, ``store_id``, ...) or
         the idempotency key is refused rather than stored as metadata.
 
-        ``idempotency_key`` makes repeating THIS EXACT write safe once the first attempt
-        has finished: the API replays the first response instead of storing again, and
-        answers 422 if the same key arrives with a different body. A repeat that overlaps
-        a first attempt still running can run twice. The window is best-effort and can be
-        shorter than 10 minutes; it is not a durable de-duplication record. Use it when the
-        retry is yours — a job that died and was re-run, a queue that redelivers. The SDK
-        retries a write only on a 429 or a 409 for a write already in flight, both answered
-        before anything is stored. It never retries a write on 408 / 502 / 503 / 504 or a
-        dropped body, where the first attempt may already have been applied — without a
-        key the client cannot know whether it was.
+        Every memory write (``add``, ``add_turn``, ``add_bulk``, ``update``) carries an
+        idempotency key: ``idempotency_key`` when you pass one, otherwise one this client
+        makes for the call. With it the client retries the write on 408 / 502 / 503 / 504
+        and on a dropped connection, as it does a read: the service answers a repeat with
+        the first attempt's result instead of storing again, and one that arrives while the
+        first is still running with a 409 to wait, which is retried as well.
+
+        Pass your own key when the retry is yours: a job that died and was re-run, a queue
+        that redelivers. The service keeps a key for 24 hours and answers a repeat with the
+        first successful response, marked ``replayed: True``; the same key with a different
+        body is refused (422). A first attempt that failed is not kept, so a repeat of it
+        runs, unless it did not come back with an answer, so whether it was applied is not
+        known: then the repeat is refused with a ``ConflictError``
+        (409) instead of storing it twice; check before sending it again under a new key.
+        This client sets ``replayed`` only for a key you passed, and then the earlier
+        request can also be an attempt of this same call that the client sent again after an
+        answer that left the outcome open.
 
         Derive the key from the thing being stored (``f"import:{row.id}"``), never a
         constant: reusing one key for two different writes replays the first and the second
@@ -2130,7 +2207,7 @@ class Client:
         body: dict = {"user_id": sid, "content": content, "metadata": md}
         if image is not None:
             body["image"] = _normalize_image(image)
-        return self._post(
+        return self._write(
             "/api/v1/memory/store",
             body,
             model=model,
@@ -2150,7 +2227,7 @@ class Client:
         ``user_id`` is optional; omit it to use the client's default store
         (``add_turn("hi", "yo")`` or ``add_turn(user_msg="hi", assistant_msg="yo")``).
         """
-        return self._post(
+        return self._write(
             "/api/v1/memory/store-turn",
             {"user_id": self._uid(user_id), "user_msg": user_msg, "assistant_msg": assistant_msg},
             model=model,
@@ -2173,7 +2250,7 @@ class Client:
                                 "category": "general" if category is None else category}
         if timestamp:
             body["timestamp"] = timestamp
-        return self._post("/api/v1/memory/bulk-store", body, model=model,
+        return self._write("/api/v1/memory/bulk-store", body, model=model,
                           idempotency_key=idempotency_key)
 
     def update(
@@ -2186,7 +2263,7 @@ class Client:
         ``user_id`` is optional; omit it to use the client's default store
         (``update(old_memory_id=..., new_content=...)``).
         """
-        return self._post(
+        return self._write(
             "/api/v1/memory/supersede",
             {"user_id": self._uid(user_id), "old_memory_id": old_memory_id, "new_content": new_content},
             model=model,
@@ -2354,7 +2431,17 @@ class Client:
         """One-call context for an LLM: short-term turns + long-term matches + surrounding context.
 
         Returns ``{"short_term": ..., "long_term": ..., "context": ...}``. No extra
-        round-trips. ``user_id`` is optional — omit it to use the client's default store.
+        round-trips:
+
+        - ``short_term["turns"]``: the recent conversation, oldest first, each
+          ``{"role": "user" | "assistant", "content", "timestamp"}``.
+        - ``long_term["memories"]``: the stored memories that match, best first, each shaped
+          like a ``search`` result.
+        - ``context["around_top_memory"]``: the conversation around the best memory, in the
+          order it was said. Each row is a string that starts with where it sits next to
+          that memory: ``"[before] "``, ``"[match] "`` or ``"[after] "``.
+
+        ``user_id`` is optional — omit it to use the client's default store.
         ``form`` (``"memoir"``/``"archive"``, on a model with the ``forms`` capability)
         renders each long-term memory's time in that form; ``tz`` is your UTC-offset
         hours for that rendering.
@@ -2369,7 +2456,7 @@ class Client:
         not ask for.
         """
         body = _recall_body(self._uid(user_id), query, form, tz, limit, context_limit)
-        return self._post("/api/v1/memory/recall", body, model=model)
+        return _recall_shape(self._post("/api/v1/memory/recall", body, model=model))
 
     def engram(
         self, name: str, query: str, user_id: Optional[str] = None, *, model: Optional[str] = None,
@@ -2526,9 +2613,11 @@ class Client:
 
     def forget_image(self, user_id: Optional[str] = None, memory_id: str = _NO_ID, *,
                      preview: bool = False, model: Optional[str] = None) -> dict:
-        """Remove the PHOTO from a memory, keeping its text.
+        """Remove the PHOTO from a memory. It can take the whole memory with it.
 
-        ``preview=True`` reports what would happen and changes nothing.
+        ``preview=True`` reports what would happen, including ``memory_kept`` (``False``
+        when the memory itself would go), and changes nothing. Call it first when the
+        memory's text matters.
         """
         user_id, memory_id = _split_id_args(user_id, memory_id)
         memory_id = _require_memory_id(memory_id, "the id of the memory whose image you want removed")
@@ -2874,6 +2963,17 @@ class Client:
         return self._request("POST", path, json_body=body, model=model,
                              idempotency_key=idempotency_key)
 
+    def _write(self, path: str, body: dict, model: Optional[str] = None,
+               idempotency_key: Optional[str] = None) -> dict:
+        """A memory write. It always carries an ``Idempotency-Key``, the caller's or one
+        made for this call, so an answer that leaves the outcome open (408/502/503/504, a
+        dropped connection) can be retried: the service answers the retry with the first
+        attempt's result instead of storing again."""
+        made = idempotency_key is None
+        return self._request("POST", path, json_body=body, model=model,
+                             idempotency_key=_new_idempotency_key() if made else idempotency_key,
+                             made_key=made)
+
     def _request(
         self,
         method: str,
@@ -2884,6 +2984,7 @@ class Client:
         model: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         removes: Optional[bool] = None,
+        made_key: bool = False,
     ) -> dict:
         status, headers, payload = self._call(method, path, json_body=json_body, params=params,
                                               model=model, idempotency_key=idempotency_key,
@@ -2892,8 +2993,10 @@ class Client:
         # Surface whether the write was stored or replayed. The server says so with the
         # Idempotent-Replayed header, and the caller cannot tell otherwise. Only when the
         # body does not already carry it: a response may carry fields this client has
-        # never seen, and the service's value wins over a guess.
-        if headers.get("Idempotent-Replayed") == "true" and "replayed" not in data:
+        # never seen, and the service's value wins over a guess. Not for a key this client
+        # made (`made_key`): the caller's one call stored once, and `replayed` would tell
+        # them nothing was stored.
+        if not made_key and headers.get("Idempotent-Replayed") == "true" and "replayed" not in data:
             data["replayed"] = True
         return data
 
@@ -2912,7 +3015,8 @@ class Client:
             headers.update(idem)
         data = _encode_json(json_body)
         url = f"{self._base}{path}"
-        call = _Call(method, path, self._retries, self._deadline, removes=removes, reads=reads)
+        call = _Call(method, path, self._retries, self._deadline, removes=removes, reads=reads,
+                     keyed=idem is not None)
         for attempt in range(call.attempts):
             call.attempt = attempt
             clock = call.clock(self._timeout)
@@ -2924,6 +3028,7 @@ class Client:
             status, rheaders, payload = got
             # `rate_limit` reports the most recent response that carried the headers.
             self._rate_limit = _parse_rate_limit(rheaders) or self._rate_limit
+            _warn_if_retiring(eff_model, rheaders)
             _logger.debug("%s -> %d in %.0fms (attempt %d/%d)", call.where, status,
                           (time.monotonic() - start) * 1000, attempt + 1, call.attempts)
             if 200 <= status < 300:
@@ -3269,7 +3374,7 @@ class AsyncClient:
         body: dict = {"user_id": sid, "content": content, "metadata": md}
         if image is not None:
             body["image"] = _normalize_image(image)
-        return await self._post(
+        return await self._write(
             "/api/v1/memory/store",
             body,
             model=model,
@@ -3284,7 +3389,7 @@ class AsyncClient:
         model: Optional[str] = None, idempotency_key: Optional[str] = None,
     ) -> dict:
         """Store a conversation turn (user + assistant). Payload first, ``user_id`` second."""
-        return await self._post(
+        return await self._write(
             "/api/v1/memory/store-turn",
             {"user_id": self._uid(user_id), "user_msg": user_msg, "assistant_msg": assistant_msg},
             model=model,
@@ -3302,7 +3407,7 @@ class AsyncClient:
                                 "category": "general" if category is None else category}
         if timestamp:
             body["timestamp"] = timestamp
-        return await self._post("/api/v1/memory/bulk-store", body, model=model,
+        return await self._write("/api/v1/memory/bulk-store", body, model=model,
                                 idempotency_key=idempotency_key)
 
     async def update(
@@ -3310,7 +3415,7 @@ class AsyncClient:
         model: Optional[str] = None, idempotency_key: Optional[str] = None,
     ) -> dict:
         """Supersede an old memory with new content. Payload first, ``user_id`` second."""
-        return await self._post(
+        return await self._write(
             "/api/v1/memory/supersede",
             {"user_id": self._uid(user_id), "old_memory_id": old_memory_id, "new_content": new_content},
             model=model,
@@ -3377,11 +3482,11 @@ class AsyncClient:
         form: Optional[str] = None, tz: Optional[int] = None,
         limit: Optional[int] = None, context_limit: Optional[int] = None,
     ) -> dict:
-        """One-call context for an LLM: ``{"short_term", "long_term", "context"}``.
-        ``form``/``tz`` render long-term memory times (memoir/archive) on a model with the
-        ``forms`` capability."""
+        """One-call context for an LLM: ``{"short_term", "long_term", "context"}``, shaped
+        as ``Client.recall`` describes. ``form``/``tz`` render long-term memory times
+        (memoir/archive) on a model with the ``forms`` capability."""
         body = _recall_body(self._uid(user_id), query, form, tz, limit, context_limit)
-        return await self._post("/api/v1/memory/recall", body, model=model)
+        return _recall_shape(await self._post("/api/v1/memory/recall", body, model=model))
 
     async def engram(
         self, name: str, query: str, user_id: Optional[str] = None, *, model: Optional[str] = None,
@@ -3486,8 +3591,9 @@ class AsyncClient:
 
     async def forget_image(self, user_id: Optional[str] = None, memory_id: str = _NO_ID, *,
                            preview: bool = False, model: Optional[str] = None) -> dict:
-        """Remove the PHOTO from a memory, keeping its text. ``preview=True`` reports what
-        would happen and changes nothing."""
+        """Remove the PHOTO from a memory; it can take the whole memory with it.
+        ``preview=True`` reports what would happen, including ``memory_kept``, and changes
+        nothing; see ``Client.forget_image``."""
         user_id, memory_id = _split_id_args(user_id, memory_id)
         memory_id = _require_memory_id(memory_id, "the id of the memory whose image you want removed")
         body: dict = {"user_id": self._uid(user_id), "memory_id": _reject_ctl("memory_id", memory_id)}
@@ -3705,6 +3811,14 @@ class AsyncClient:
         return await self._request("POST", path, json_body=body, model=model,
                                    idempotency_key=idempotency_key)
 
+    async def _write(self, path: str, body: dict, model: Optional[str] = None,
+                     idempotency_key: Optional[str] = None) -> dict:
+        """A memory write, with a key made for it when none was given — see ``Client._write``."""
+        made = idempotency_key is None
+        return await self._request("POST", path, json_body=body, model=model,
+                                   idempotency_key=_new_idempotency_key() if made else idempotency_key,
+                                   made_key=made)
+
     async def _request_bytes(self, path: str, body: dict, *, model: Optional[str] = None) -> tuple[bytes, str]:
         """One request that answers with BYTES rather than JSON — see ``Client._request_bytes``."""
         status, headers, data = await self._call("POST", path, json_body=body, model=model, reads=True)
@@ -3722,13 +3836,14 @@ class AsyncClient:
         model: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         removes: Optional[bool] = None,
+        made_key: bool = False,
     ) -> dict:
         status, headers, payload = await self._call(method, path, json_body=json_body, params=params,
                                                     model=model, idempotency_key=idempotency_key,
                                                     removes=removes)
         data = _parse_ok(status, payload.decode("utf-8", "replace"))
-        # Only when absent — see the sync client for why.
-        if headers.get("Idempotent-Replayed") == "true" and "replayed" not in data:
+        # Only when absent, and never for a key this client made — see the sync client.
+        if not made_key and headers.get("Idempotent-Replayed") == "true" and "replayed" not in data:
             data["replayed"] = True
         return data
 
@@ -3779,7 +3894,8 @@ class AsyncClient:
             headers.update(idem)
         data = _encode_json(json_body)
         url = f"{self._base}{path}"
-        call = _Call(method, path, self._retries, self._deadline, removes=removes, reads=reads)
+        call = _Call(method, path, self._retries, self._deadline, removes=removes, reads=reads,
+                     keyed=idem is not None)
         for attempt in range(call.attempts):
             call.attempt = attempt
             clock = call.clock(self._timeout)
@@ -3792,6 +3908,7 @@ class AsyncClient:
                 continue
             status, rheaders, payload = got
             self._rate_limit = _parse_rate_limit(rheaders) or self._rate_limit
+            _warn_if_retiring(eff_model, rheaders)
             _logger.debug("%s -> %d in %.0fms (attempt %d/%d)", call.where, status,
                           (time.monotonic() - start) * 1000, attempt + 1, call.attempts)
             if 200 <= status < 300:

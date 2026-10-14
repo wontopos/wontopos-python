@@ -29,26 +29,69 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 
 ## Methods
 
-| Method | Purpose |
+| Method | What it does |
 |---|---|
-| `add(content, user_id, **metadata)` | Store one memory |
-| `add_turn(user_msg, assistant_msg, user_id?)` | Store a conversation exchange |
-| `add_bulk(content, user_id, category=, timestamp=)` | Backfill a long history |
-| `update(old_memory_id, new_content, user_id?)` | Supersede an old fact |
-| `search(query, user_id, limit=10, **opts)` | Search stored memories |
-| `search_full(query, user_id, limit=10, **opts)` | The same search with every field kept — `images` and `verify_used` included |
-| `recall(query, user_id)` | One-call context (short + long + surrounding) |
-| `history(user_id)` | Recent turns (short-term) |
-| `stats(user_id)` | Counts |
-| `get(user_id, memory_id)` | Fetch one memory by id (the text you stored, and its metadata) |
-| `list_memories(user_id, limit=100, cursor=)` | Browse/export a store's raw memories, paged |
-| `delete(user_id, memory_id)` | Delete one memory |
-| `delete_all(user_id)` | GDPR erase (delete every memory for the user) |
-| `add_speaker(speaker, user_id?)` | Register a person (explicit, up to 50 to start) |
-| `list_speakers(user_id?)` | Registered people + per-person memory counts |
-| `remove_speaker(speaker, user_id?)` | Unregister; memories stay. The tag goes, except on `tablet-2`, which keeps it on memories already stored |
+| **Write** | |
+| `add(content, user_id, **metadata)` | Store one memory. Alias `store`. `image=` attaches a photo. |
+| `add_turn(user_msg, assistant_msg, user_id?)` | Store one exchange of a conversation. |
+| `add_bulk(content, user_id, category=, timestamp=)` | Backfill a long history in one call. |
+| `update(old_memory_id, new_content, user_id?)` | Replace a fact that changed. The old version stays in its history. |
+| **Read** | |
+| `recall(query, user_id)` | The recent turns, the memories that match and the conversation around the best one, in one call. |
+| `search(query, user_id, limit=10, **opts)` | The memories that match, best first. |
+| `search_full(query, user_id, limit=10, **opts)` | The same search with each part kept apart, `images` and `verify_used` included. |
+| `search_self(query, user_id, ...)` | The assistant's own words, kept apart from what others said. |
+| `history(user_id)` | The recent conversation. |
+| `get(user_id, memory_id)` | One memory by id, the text you stored and its metadata. |
+| `list_memories` · `iter_memories` · `export_memories` | Every memory in a store: a page at a time, as a stream, or all at once. |
+| `lineage(user_id, memory_id)` | The edits that followed one memory. |
+| `revisions(user_id)` | How many of a store's memories were edited, and which. |
+| `stats(user_id)` | Counts for a store. |
+| `engram(name, query, user_id)` · `list_engrams()` | Built-in retrieval routines, and the ones a model can run. |
+| **Photos** | |
+| `list_images` · `iter_images` · `export_images` | A store's image memories, newest first. |
+| `get_image(user_id, memory_id)` | The bytes of one image, and its content type. |
+| `forget_image(user_id, memory_id, preview=False)` | Remove the photo from a memory. `preview=True` first says whether the memory itself stays. |
+| **People** | |
+| `add_speaker(speaker, user_id?)` | Register a person (explicit, up to 50 to start). |
+| `list_speakers(user_id?)` | Registered people and per-person memory counts. |
+| `remove_speaker(speaker, user_id?)` | Unregister; memories stay. The tag goes, except on `tablet-2`, which keeps it on memories already stored. |
+| `by_speaker(speaker, user_id?)` | What one person said, newest first. |
+| **Stores** | |
+| `create_store` · `list_stores` · `delete_store` | One isolated memory space per end-user, agent or topic. |
+| `delete(user_id, memory_id)` · `delete_all(user_id)` | Delete one memory, or every memory in a store (GDPR erase). |
+| **Account** | |
+| `list_models()` | The models you can use, and what each can do. |
+| `usage(days=7)` | What this key, its workspace and its stores have spent. Free. |
+| `ping()` | Check the key and the connection. |
+| **Client** | |
+| `with_model` · `with_user` · `with_deadline` · `with_timeout` · `with_retries` | A copy of the client with another model, store, budget, timeout or retry count. |
+| `Client.from_env()` · `rate_limit` · `close()` | A client with the key from the environment; the last call's rate-limit numbers; release the connections. |
 
-All methods take a `user_id` — it names the **store**: one isolated memory space per end-user, agent, or topic, then per workspace (your API key's). WHO said each memory inside a store is the `speaker` tag below — storing the assistant's own words never needs a separate id.
+Every method that works on a store takes a `user_id` — it names the **store**: one isolated memory space per end-user, agent, or topic, then per workspace (your API key's). WHO said each memory inside a store is the `speaker` tag below — storing the assistant's own words never needs a separate id.
+
+## Putting recall into a prompt
+
+```python
+ctx = mem.recall(user_message, user_id="alice")
+
+system = "\n".join([
+    "What you remember about this user, most relevant first:",
+    *(f"- {m['content']}" for m in ctx["long_term"]["memories"]),
+    "",
+    "Around the most relevant memory:",
+    *ctx["context"]["around_top_memory"],
+    "",
+    "The conversation so far:",
+    *(f"{t['role']}: {t['content']}" for t in ctx["short_term"]["turns"]),
+])
+
+# Call your language model with `system` and the user's message, then store the exchange:
+mem.add_turn(user_message, reply, user_id="alice")
+```
+
+Each row of `around_top_memory` starts with `[before] `, `[match] ` or `[after] `: where it
+sits next to the best memory. Keep every list in the order it arrives.
 
 ## Who said it (speakers)
 
@@ -97,6 +140,43 @@ Every `Client` method but `close` exists on `AsyncClient` with identical argumen
 and semantics (retries, redirect refusal, guards). Close it with `async with` or
 `await mem.aclose()`.
 
+## Photos
+
+On a model whose `list_models()` capabilities include `images`, a memory can carry a photo.
+The caption is still required.
+
+```python
+import base64
+
+with open("beach.jpg", "rb") as f:
+    data = base64.b64encode(f.read()).decode()
+stored = mem.add("At the beach with Bob", user_id="alice",
+                 image={"data": data, "taken_at": "2026-08-14"})
+
+image, content_type = mem.get_image("alice", stored["id"])
+with open(f"beach.{content_type.split('/')[1]}", "wb") as f:
+    f.write(image)
+```
+
+Both edges must be 700px or more, the long edge at most 2500px and the file at most 7MB;
+anything else is refused (400) with the reason. A long edge over 1568px is stored at
+1568px, so keep your own copy of the original. `search` returns image memories after
+the others, and `list_images` pages through them newest first. `forget_image` removes the
+photo, and it can remove the whole memory with it: call it with `preview=True` first, and
+`memory_kept` says whether the memory stays.
+
+## Export, edit history and usage
+
+- **Export:** `export_memories(user_id)` returns every memory in a store, the text you
+  stored and its metadata; `export_images(user_id)` every image memory. For a large store,
+  `iter_memories` and `iter_images` stream them a page at a time.
+- **Edit history:** `update` replaces a fact that changed. `lineage(user_id, memory_id)`
+  lists the versions from the id you pass forward, oldest first, and marks the one in force
+  with `is_current`; pass the first version's id to see the whole history. `revisions()`
+  counts how many of a store's memories were edited.
+- **Usage:** `usage(days)` reports this key's spend, the workspace's spend over the window,
+  the stores that spent the most, and the balance. It is free, and works at a zero balance.
+
 ## Recall caching
 
 Opt in per search and a repeated query reuses the previous result at 10% of the
@@ -122,14 +202,22 @@ Built in, no configuration needed:
 
 - **Automatic retries** — 429 and a 409 for a write already in flight always, and 408 /
   502 / 503 / 504 or a connection error only when a retry cannot double-process a write.
-  A write may already have landed when any of those four comes back, so a POST write gets
-  429, that 409 and connect-level failures only. The calls that are safe to send again
-  retry all four: the reads sent as POST (`search`, `recall`, `get`, `list_memories`,
-  `stats`, ...) and the GET and DELETE calls (`ping`, `list_stores`, `list_speakers`,
-  `list_models`, `list_engrams`, `usage`, `delete_store`, `remove_speaker`,
-  `forget_image`). Twice, with exponential backoff + jitter, honoring
-  the server's `Retry-After` up to 30s. Tune with `Client(retries=...)`; `retries=0`
-  disables.
+  The calls that are safe to send again retry all four: the reads sent as POST (`search`,
+  `recall`, `get`, `list_memories`, `stats`, ...), the GET and DELETE calls (`ping`,
+  `list_stores`, `list_speakers`, `list_models`, `list_engrams`, `usage`, `delete_store`,
+  `remove_speaker`, `forget_image`), and the memory writes (`add`, `add_turn`, `add_bulk`,
+  `update`). Those carry an idempotency key, so the service answers a repeat with the
+  first attempt's result instead of storing again. The other writes sent as POST
+  (`create_store`, `add_speaker`, `delete`, `delete_all`) get 429, that 409 and
+  connect-level failures only. Twice, with exponential backoff + jitter, honoring the
+  server's `Retry-After` up to 30s. Tune with `Client(retries=...)`; `retries=0` disables.
+- **Your own retries** — pass `idempotency_key=` when the retry is yours (a job that is
+  re-run, a queue that redelivers). The service keeps a key for 24 hours and answers a
+  repeat with the first response, marked `"replayed": True`. When the first attempt did
+  not come back with an answer, so whether it was applied is not known, a repeat
+  is refused with a `ConflictError` (409) rather than stored twice: check before sending
+  it again under a new key. Derive the key from what you store (`f"import:{row.id}"`),
+  never a constant.
 - **Redirects refused** — the API key never follows a 3xx to another host.
 - **Timeouts** — 30s per attempt by default (`Client(timeout=...)`), and a total
   budget for the whole call across every retry with `Client(deadline=...)` /
@@ -177,7 +265,8 @@ except WosError as e:
 
 A retired model answers `410`, raised as `GoneError`: retrying cannot succeed, so name
 a live model (`list_models()` lists them, with `retires_at` on one that is scheduled to
-retire). `delete_store` still works under a retired model.
+retire). Before the day, the client logs a warning once with the date the model you use
+retires. `delete_store` still works under a retired model.
 
 ## A different API host
 
@@ -208,7 +297,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Nine inside 2.2 were not, deliberately and each with its
+releases are additive. Ten inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

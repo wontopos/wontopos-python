@@ -6,6 +6,37 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.47 — 2026-10-14
+
+**A write that met a server error is sent again safely, a retiring model says so before
+the day, and an API key stays out of browser pages.**
+
+- Every memory write (`add`, `add_turn`, `add_bulk`, `update`) carries an idempotency
+  key: the one you pass, or one the client makes for the call. With it a write is retried
+  on 408/502/503/504 and on a connection that dropped, as a read is, and the service
+  answers the repeat with the first attempt's result instead of storing it again. A repeat
+  that arrives while the first attempt is still running is answered with a 409 to wait,
+  and retried. One whose first attempt did not come back with an answer, so whether it
+  was stored is not known, is refused with a 409 instead of being stored twice. The
+  service keeps a key for 24 hours. The client sets `replayed` only for
+  a key you passed. The other writes sent as POST (`create_store`, `add_speaker`, `delete`,
+  `delete_all`) are still not sent again on those four.
+- A model scheduled to retire names the day in a `Sunset` header on its answers, and the
+  client warns once per model and day: which model, the day, and that its calls answer
+  410 from then on, `delete_store` aside.
+- TypeScript refuses to run in a browser page that would send the API key to the service:
+  anyone who opens the page can read the key, and with it every memory in its workspace.
+  Call Wontopos from your server, or point `baseUrl` at a proxy of your own that holds the
+  key. `dangerouslyAllowBrowser: true` turns the refusal off, for a local demo with a key
+  you will revoke.
+- `recall`'s parts are typed. TypeScript types `short_term.turns` as `HistoryTurn[]` and
+  `context.around_top_memory` as `string[]`; Rust adds `RecallResponse::turns`,
+  `memories` and `context_rows`, and a `Turn` type; Python's docstring describes each
+  part. A row of any other kind is dropped, as `history` drops it. Each row around the
+  best memory starts with `[before] `, `[match] ` or `[after] `.
+- The READMEs have a table of the methods by what they do, and show a recall put into a prompt, photos, export,
+  edit history and usage.
+
 ## 2.2.46 — 2026-10-09
 
 **Reads are retried, and the docs say what the service does.**
