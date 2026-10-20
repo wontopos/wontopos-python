@@ -40,7 +40,8 @@ jitter, honoring ``Retry-After`` up to 30s — 429 and a 409 for a write already
 flight on every call; 408/502/503/504 and connection errors only when a retry cannot
 apply a write twice (reads, the DELETE calls, the memory writes, which carry an
 idempotency key, or a failure at connect time). ``timeout=``
-bounds each attempt and ``deadline=`` the whole call, in wall-clock time. Tune with
+bounds each attempt (by default 200s for ``add``, ``add_turn`` and ``add_bulk``, 30s
+for everything else) and ``deadline=`` the whole call, in wall-clock time. Tune with
 ``Client(retries=...)`` (0 disables), or per call site via the ``with_timeout()`` /
 ``with_retries()`` / ``with_deadline()`` clones.
 
@@ -83,7 +84,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.47"
+__version__ = "2.2.48"
 
 # Without this, `from wontopos import *` also bound os, sys, json, re, time,
 # random, logging, platform, ssl and requests in the caller's namespace, and they
@@ -1131,6 +1132,12 @@ def _timed_out(exc: BaseException) -> bool:
 
 # The longest a retry waits. A Retry-After beyond it ends the call with that error.
 _MAX_WAIT = 30.0
+# How long one attempt waits when the caller set no timeout. Storing a long text can take
+# the service up to three minutes, so add, add_turn and add_bulk wait longer than the
+# rest; a timeout the caller sets applies to every call.
+_DEFAULT_TIMEOUT = 30.0
+_STORE_TIMEOUT = 200.0
+_STORE_PATHS = frozenset({"/api/v1/memory/store", "/api/v1/memory/store-turn", "/api/v1/memory/bulk-store"})
 _DELTA_SECONDS_RE = re.compile(r"[0-9]+")
 # The three HTTP-date forms of RFC 9110: IMF-fixdate, RFC 850 and asctime.
 _HTTP_DATE_RE = re.compile(
@@ -1939,7 +1946,10 @@ class Client:
         base_url: API base URL (defaults to the hosted service). Whitespace at either
                   end is trimmed; whitespace inside it, or a backslash, is refused.
         timeout:  wall-clock limit for one attempt, in seconds, however slowly the
-                  response arrives. Each retry gets its own.
+                  response arrives. Each retry gets its own. When it is not set,
+                  ``add``, ``add_turn`` and ``add_bulk`` wait 200: storing a long text
+                  can take the service up to three minutes. Every other call waits 30.
+                  A timeout you set applies to every call.
         model:    default model for every call (sent as ``X-WOS-Model``).
                   See ``list_models()`` for what's available.
         user_id:  default store for every call. Pass ``user_id=`` on a single
@@ -1950,7 +1960,8 @@ class Client:
                   0 disables retries.
         deadline: a total budget for one call, in seconds, across every attempt and
                   the waits between them. ``timeout`` bounds one attempt; at the
-                  defaults (30s, two retries) a call can take over a minute. When the
+                  defaults (two retries) a call can take over a minute, and ``add``,
+                  ``add_turn`` or ``add_bulk`` over ten. When the
                   next wait does not fit, the last response's error is raised.
                   ``None`` means no overall budget.
     """
@@ -1961,7 +1972,7 @@ class Client:
         self,
         api_key: str,
         base_url: str = DEFAULT_BASE_URL,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,
         model: str = DEFAULT_MODEL,
         user_id: str = DEFAULT_USER,
         retries: Optional[int] = None,
@@ -1977,7 +1988,11 @@ class Client:
             retries = 2 if max_retries is None else max_retries
         self._api_key = _clean_key(api_key)
         self._base = _check_base_url(base_url)
-        self._timeout = _check_seconds(timeout, 30.0)
+        # None rather than 30, so that "the caller set a timeout" and "the caller said
+        # nothing" are different states: only the second waits longer for a store.
+        self._timeout_set = _check_seconds(timeout, None)
+        self._timeout = self._timeout_set or _DEFAULT_TIMEOUT
+        self._store_timeout = self._timeout_set or _STORE_TIMEOUT
         self._deadline = _check_seconds(deadline, None)
         self._model = _check_model(model)
         # The store every call uses unless one passes user_id=. "default" is the
@@ -2035,7 +2050,7 @@ class Client:
         drop a caller's session pooling.
         """
         kw: dict = dict(
-            api_key=self._api_key, base_url=self._base, timeout=self._timeout,
+            api_key=self._api_key, base_url=self._base, timeout=self._timeout_set,
             model=self._model, user_id=self._user_id, retries=self._retries,
             deadline=self._deadline, _session=self._session,
         )
@@ -2047,8 +2062,8 @@ class Client:
 
             mem.with_deadline(5.0).search(q, user_id="alice")   # a handler with 5s
 
-        ``timeout`` bounds ONE attempt. At the defaults — 30s, two retries — a single
-        call can take over a minute.
+        ``timeout`` bounds ONE attempt. At the defaults (two retries) a single call can
+        take over a minute, and ``add``, ``add_turn`` or ``add_bulk`` over ten.
         """
         return self._clone(deadline=deadline)
 
@@ -2069,9 +2084,10 @@ class Client:
 
     def with_timeout(self, timeout: float) -> "Client":
         """A client with a different per-attempt timeout in seconds (everything else kept).
-        Shares this client's connection pool.
+        It applies to every call, ``add``, ``add_turn`` and ``add_bulk`` included. Shares
+        this client's connection pool.
 
-            mem.with_timeout(120).add_bulk(big_blob)   # this slow call only
+            mem.with_timeout(300).add_bulk(huge_blob)   # this slow call only
         """
         return self._clone(timeout=timeout)
 
@@ -3019,7 +3035,7 @@ class Client:
                      keyed=idem is not None)
         for attempt in range(call.attempts):
             call.attempt = attempt
-            clock = call.clock(self._timeout)
+            clock = call.clock(self._store_timeout if path in _STORE_PATHS else self._timeout)
             start = time.monotonic()
             got = self._attempt(method, url, data, params, headers or None, clock, call)
             if isinstance(got, _Failure):
@@ -3217,7 +3233,7 @@ class AsyncClient:
         self,
         api_key: str,
         base_url: str = DEFAULT_BASE_URL,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,
         model: str = DEFAULT_MODEL,
         user_id: str = DEFAULT_USER,
         retries: Optional[int] = None,
@@ -3241,7 +3257,10 @@ class AsyncClient:
         self._api_key = _clean_key(api_key)
         self._base = _check_base_url(base_url)
         _require_url(self._base, _async_scheme_host)
-        self._timeout = _check_seconds(timeout, 30.0)
+        # As in the sync client: None means the caller set no timeout.
+        self._timeout_set = _check_seconds(timeout, None)
+        self._timeout = self._timeout_set or _DEFAULT_TIMEOUT
+        self._store_timeout = self._timeout_set or _STORE_TIMEOUT
         self._deadline = _check_seconds(deadline, None)
         self._model = _check_model(model)
         # The same guard _uid applies per call, so the constructor and with_user() —
@@ -3321,7 +3340,7 @@ class AsyncClient:
         drop a caller's session pooling.
         """
         kw: dict = dict(
-            api_key=self._api_key, base_url=self._base, timeout=self._timeout,
+            api_key=self._api_key, base_url=self._base, timeout=self._timeout_set,
             model=self._model, user_id=self._user_id, retries=self._retries,
             deadline=self._deadline, _http=self._transport,
         )
@@ -3898,7 +3917,7 @@ class AsyncClient:
                      keyed=idem is not None)
         for attempt in range(call.attempts):
             call.attempt = attempt
-            clock = call.clock(self._timeout)
+            clock = call.clock(self._store_timeout if path in _STORE_PATHS else self._timeout)
             start = time.monotonic()
             got = await self._attempt(http, method, url, data, params, headers or None, clock, call)
             # The sleeps below run after the response is closed, so a backoff never holds

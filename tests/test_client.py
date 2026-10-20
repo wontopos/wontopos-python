@@ -3095,6 +3095,82 @@ class TimeoutValuesTest(unittest.TestCase):
         self.assertIsNone(mem._deadline)
 
 
+class StoreTimeoutTest(unittest.TestCase):
+    """add, add_turn and add_bulk wait 200s an attempt unless the caller set a timeout;
+    every other call waits 30s, and a timeout the caller sets applies to every call."""
+
+    CLASSES = (Client, AsyncClient) if HAVE_HTTPX else (Client,)
+    EXPECTED = [
+        ("POST /api/v1/memory/store", 200.0),
+        ("POST /api/v1/memory/store-turn", 200.0),
+        ("POST /api/v1/memory/bulk-store", 200.0),
+        ("POST /api/v1/memory/supersede", 30.0),
+        ("POST /api/v1/memory/search", 30.0),
+    ]
+
+    def test_defaults(self):
+        for cls in self.CLASSES:
+            with self.subTest(cls=cls.__name__):
+                mem = cls(KEY)
+                self.assertEqual((mem._timeout, mem._store_timeout), (30.0, 200.0))
+
+    def test_a_timeout_the_caller_sets_applies_to_every_call_and_clones_keep_it(self):
+        for cls in self.CLASSES:
+            with self.subTest(cls=cls.__name__):
+                mem = cls(KEY, timeout=10)
+                self.assertEqual((mem._timeout, mem._store_timeout), (10, 10))
+                self.assertEqual(mem.with_model("tablet-1")._store_timeout, 10)
+                self.assertEqual(cls(KEY).with_timeout(5)._store_timeout, 5)
+                self.assertEqual(cls(KEY).with_user("bob")._store_timeout, 200.0)
+                self.assertEqual(cls(KEY, timeout=0)._store_timeout, 200.0)
+
+    def spy(self):
+        from unittest import mock
+        waits = []
+        clock = wontopos._Call.clock
+
+        def record(call, timeout):
+            waits.append((call.where, timeout))
+            return clock(call, timeout)
+
+        return waits, mock.patch.object(wontopos._Call, "clock", record)
+
+    def script(self):
+        srv, base = scripted_server([(200, {}, "{}")] * 4 + [(200, {}, '{"results": []}')])
+        self.addCleanup(srv.shutdown)
+        return base
+
+    def test_each_call_waits_its_own_default(self):
+        mem = Client(KEY, base_url=self.script())
+        self.addCleanup(mem.close)
+        waits, patch = self.spy()
+        with patch:
+            mem.add("x", "alice")
+            mem.add_turn("hi", "yo", "alice")
+            mem.add_bulk("blob", "alice", "general", None)
+            mem.update("m1", "new", "alice")
+            mem.search("q", "alice")
+        self.assertEqual(waits, self.EXPECTED)
+
+    @needs_httpx
+    def test_each_async_call_waits_its_own_default(self):
+        import asyncio
+        base = self.script()
+        waits, patch = self.spy()
+
+        async def main():
+            async with AsyncClient(KEY, base_url=base) as mem:
+                await mem.add("x", "alice")
+                await mem.add_turn("hi", "yo", "alice")
+                await mem.add_bulk("blob", "alice", "general", None)
+                await mem.update("m1", "new", "alice")
+                await mem.search("q", "alice")
+
+        with patch:
+            asyncio.run(main())
+        self.assertEqual(waits, self.EXPECTED)
+
+
 @needs_httpx
 class AsyncLifecycleTest(unittest.TestCase):
     """An AsyncClient belongs to the event loop it first ran on and ends at aclose(). Using

@@ -219,10 +219,12 @@ Built in, no configuration needed:
   it again under a new key. Derive the key from what you store (`f"import:{row.id}"`),
   never a constant.
 - **Redirects refused** — the API key never follows a 3xx to another host.
-- **Timeouts** — 30s per attempt by default (`Client(timeout=...)`), and a total
-  budget for the whole call across every retry with `Client(deadline=...)` /
-  `with_deadline(secs)`. At the defaults one call can hold for 30s + backoff + 30s
-  + backoff + 30s, which a request handler with five seconds cannot use.
+- **Timeouts** — 30s per attempt by default, and 200s for `add`, `add_turn` and
+  `add_bulk`: storing a long text can take the service up to three minutes. A
+  `Client(timeout=...)` you set applies to every call. A total budget for the whole
+  call across every retry is `Client(deadline=...)` / `with_deadline(secs)`. At the
+  defaults one call can hold for three attempts and the backoff between them, which a
+  request handler with five seconds cannot use.
 - **Key never in logs** — `repr(client)` masks the API key.
 - **Wipe guard** — `delete()` without a `memory_id` raises instead of silently
   meaning "delete everything"; wiping a store is only ever the explicit

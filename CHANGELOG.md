@@ -6,6 +6,16 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.48 — 2026-10-20
+
+**A long text is stored without the client giving up first.**
+
+- `add`, `add_turn` and `add_bulk` (in Rust, their `_with` and `_idempotent` forms too)
+  wait up to 200 seconds an attempt when you set no timeout. Storing a long text can take the service up to three minutes, and a client
+  that stopped at 30 seconds reported a timeout for a memory that was still being
+  stored. Every other call still waits 30 seconds. A timeout you set (`timeout`,
+  `timeoutMs`, `with_timeout`) applies to every call, these three included.
+
 ## 2.2.47 — 2026-10-14
 
 **A write that met a server error is sent again safely, a retiring model says so before
