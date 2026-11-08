@@ -6,6 +6,115 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.50 — 2026-11-08
+
+**Your code and your model can see how much of the plan's week is used, the memory tools look the way a conversation needs, and more than 140 fixes.**
+
+- `usage()` with a key in a subscription's workspace returns `subscription.week.days`: one
+  entry for each UTC day from the day the week began to today, with the percent of the week
+  that day used. A plan's usage is still given in percent only.
+- `week_used` (`weekUsed` in TypeScript, `week_used()` in Rust) is the whole percent of the
+  plan's week used, from 0 to 100, read from the latest answer that carried the
+  `X-WOS-Week-Used` header, whatever its status. It is `None` (`null`) after a successful
+  answer without it, which is what a key outside a subscription's workspace gets.
+- TypeScript types `overflow_to_balance` and `week.days` in `usage()`'s `subscription`.
+- The memory tools take a `usage` switch (`usage=True`, `{ usage: true }`,
+  `.with_usage(true)`), off by default. On, it adds `memory_usage`, which tells your model
+  this week's plan usage in percent: used, left, today's (UTC) and when the week resets.
+  Once a turn it also adds one line to a tool result when the week is at 80% or more, or
+  when that call was paid from API credit, so the model can tell the user. Off, it adds no
+  tool and no line.
+- The memory tools have two presets on scroll-2. `S-2` is for measuring memory: its first
+  look searches with the question alone, as a benchmark asks. `S-2-live`, now the default,
+  is for everyday conversation: its first look also reads the last two lines said in the
+  past five minutes, leaves the assistant's own lines out, and spreads what it brings across
+  topics and time. `preset="S-2"` keeps what 2.2.49 did. In Rust, `memory_tools_preset`
+  names a preset.
+- Two settings choose the same things on any preset: whether a look may bring the
+  assistant's own lines (`own_words`, `ownWords`, `with_own_words`) and the diversity it
+  asks for (`diversity`, `with_diversity`: `none`, `mmr`, `temporal` or `full`). `S-2-live`
+  sets them to off and `full`; `S-2` leaves both as 2.2.49 did. In Rust they are also fields of
+  `LookOpts`: code that builds it without `..Default::default()` needs it now.
+- A stored memory's line breaks stay inside it: in a tool result each line feed, carriage
+  return, carriage return and line feed pair, U+0085, U+2028 and U+2029 becomes one line feed
+  followed by four spaces; a vertical tab or a form feed is left as it is. A speaker's name is
+  shown on one line, and a person named `you`, `user` or `note` is shown in quotes. A
+  memory without a line break, from a speaker whose name is none of those, is shown as before.
+- The line that says a call was paid from API credit goes only on that call's own result.
+- The sleep is 1.0.1. Its rules are the same; it holds them more closely:
+  - an edit whose section heading, move heading or box title holds a line break or another
+    control character is dropped before anything else is checked;
+  - a memory's line breaks stay inside its line in the sleep's prompts, and the sleep's own
+    tags inside a memory lose their opening bracket;
+  - the merge rewrites a person's section only when tonight's items name that person: the same name,
+    the name with something joined to its end when the name has two letters or more, or the
+    start of a longer name of three letters or more;
+  - the room made for a core over its cap keeps only sections the core had, and moves no one
+    when it is refused;
+  - each model call ends at its 600-second limit;
+  - naming a proposal as ripe marks it applied only on a rewrite of "## Me" made from a ripe
+    proposal;
+  - a new proposal takes the next free id, and a proposal the sleep cannot read is written
+    back as it was;
+  - past a size cap, the notes drop the oldest applied proposals first, then the oldest marks;
+  - `open_box` refuses a blank name and looks for an exact match first.
+- Refused now, where 2.2.49 sent them:
+  - a `base_url` with a query (`?`) or an anchor (`#`), for the Wontopos API and for a model
+    provider;
+  - a Wontopos key that starts with `sk-`, and a model provider key that starts with `wos-`
+    or is the client's own Wontopos key;
+  - a deadline or timeout that is not a number, is NaN or is negative (0 keeps its meaning),
+    and a retry count that is not a whole number at 0 or more;
+  - a speaker name with a line break or another control character, on every write that
+    takes one; a name is trimmed, and a blank or over-long one is refused, as `add_speaker`
+    refuses it;
+  - values the docs bound that the service would have taken or dropped: `verify` outside 0
+    to 3, `filters.min_importance` outside 0 to 1, a per-call `tz` that is not a number of
+    hours from -14 to 14, a blank `engram` name (now trimmed), a blank `update` text, and a
+    NaN or an infinity anywhere in a request body (TypeScript sent them as `null`);
+  - an `add_turn` whose user and assistant messages are both blank;
+  - a blank `update` id or `remove_speaker` name (both now trimmed);
+  - a sleep's `today` whose hour is over 23 or minute over 59;
+  - in Python, a `forget_image` `preview` that is not `True` or `False`;
+  - in TypeScript, options that `forgetImage`, `listMemories`, `iterMemories`,
+    `exportImages`, `listImages`, `iterImages`, `revisions` and `bySpeaker` do not know, and
+    a `preview` that is not `true` or `false`;
+  - in TypeScript, an `addTurn` `createdAt` Date before the year 1 or after 9999;
+  - in TypeScript, a client in a browser Web Worker, Shared Worker or Service Worker, as a
+    browser page is refused, unless `dangerouslyAllowBrowser` is set;
+  - in Rust, `with_router` with skills the new options cannot run.
+- A `search` with filters leaves out the assistant's own words, which the service does not
+  filter.
+- A sleep that cannot read part of the new memories, or whose merge comes back twice as text
+  that is not JSON, no longer moves the store's last sleep past them: its `done` is `None`
+  (`null`), and the next sleep reads them again.
+- The router reads a skill input that the model wrote as an object, where it read an empty
+  one, and `ask` gives `too_large`, not `bad_request`, for any provider's 400 that says the
+  prompt is too long.
+- In Python, `RateLimitError.retry_after` rounds a `Retry-After` given as a date up to whole
+  seconds, as TypeScript does.
+- A printed client shows at most the last four characters of a key, and only for a key of
+  24 characters or more.
+- More than 140 fixes across the three clients and the MCP server, each first shown by a
+  test that failed. Among them:
+  - Python reads a compressed answer under the size cap, and refuses an answer with more
+    than one encoding;
+  - Python's async model callers work without asyncio (anyio on trio), and a SOCKS proxy no
+    longer outlasts the call's deadline;
+  - the router finds the model's JSON, and the sleep its fenced JSON, in one pass over the
+    answer;
+  - the router's limits keep today's counts when many stores ask, and in Rust a router from
+    `with_router` keeps them;
+  - `openai_caller` steps its response format down only when the provider refuses the
+    format;
+  - TypeScript calls a `fetch` you pass as a plain function, so the browser's own `fetch`
+    works;
+  - Rust sends `X-API-Key` marked as sensitive;
+  - the docs of `revisions` say what it counts: memories edited after they were written,
+    and storing new ones never edits an old one.
+- Each client's source is split into files of at most 5,000 lines and grouped by feature.
+  Nothing you import moved.
+
 ## 2.2.49 — 2026-11-05
 
 **Scroll 2: a short-term window and rooms beside long-term memory, a working memory for one question, memory tools your model uses by itself, sleep, and a router for your skills.**

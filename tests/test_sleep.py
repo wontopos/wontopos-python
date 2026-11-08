@@ -9,7 +9,6 @@ import re
 import signal
 import sys
 import threading
-import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,7 +20,7 @@ sys.path.insert(0, _HERE)
 
 import wontopos  # noqa: E402
 from wontopos import ConflictError, ModelCallError, SleepSettings  # noqa: E402
-from test_client import HAVE_HTTPX, KEY  # noqa: E402
+from test_client import CLOCK, HAVE_HTTPX, KEY  # noqa: E402
 from test_rooms_work import BEFORE_PHOTOS, tools_digest  # noqa: E402
 
 
@@ -453,7 +452,7 @@ class _Handler(BaseHTTPRequestHandler):
 def serve(service):
     srv = HTTPServer(("127.0.0.1", 0), _Handler)
     srv.service, srv.lock = service, threading.Lock()
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.002}, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_port}"
 
 
@@ -671,7 +670,7 @@ class SleepCases:
         self.assertEqual(res["done"]["changed"], True)
         self.assertEqual((res["sleep_id"], res["memories"], res["today"]), ("s-1", 20, "2026-09-15 23:00"))
         self.assertEqual(res["llm_in"], sum(x["in"] for x in res["log"] if "in" in x))
-        self.assertEqual((res["sleep_version"], wontopos.SLEEP_VERSION, wontopos.sleep.SLEEP_VERSION), ("1.0.0",) * 3)
+        self.assertEqual((res["sleep_version"], wontopos.SLEEP_VERSION, wontopos.sleep.SLEEP_VERSION), ("1.0.1",) * 3)
         self.assertGreater(res["llm_out"], 0)
 
     async def test_pages_are_read_to_the_end_and_today_comes_from_the_reading(self):
@@ -840,6 +839,25 @@ class SleepCases:
             with self.assertRaisesRegex(TimeoutError, "the sleep's model call ran past 0.05 s"):
                 await self.sleep(mem, hangs, today="2026-09-15 23:00")
         self.assertEqual(stopped, [True] * 3, "told to stop, and tried twice more")
+
+    async def test_a_call_that_ignores_its_signal_is_raced_against_its_deadline(self):
+        svc, mem = self.new()
+        svc.give(night_rows(1, DAYS[1]))
+        release = threading.Event()
+        self.addCleanup(release.set)
+        model = Model()
+        calls = []
+
+        def deaf(c):
+            calls.append(c)
+            release.wait(5)
+            return model(c)
+        t0 = CLOCK.monotonic()
+        with mock.patch.object(wontopos.sleep, "_SLEEP_CALL_SECONDS", 0.05):
+            with self.assertRaisesRegex(TimeoutError, "the sleep's model call ran past 0.05 s"):
+                await self.sleep(mem, deaf, today="2026-09-15 23:00")
+        self.assertLess(CLOCK.monotonic() - t0, 4)
+        self.assertEqual(len(calls), 3, "raced at its deadline, and tried twice more")
 
     async def test_merge_llm_writes_and_an_async_caller_is_awaited(self):
         svc, mem = self.new()
@@ -1034,7 +1052,7 @@ class SleepCases:
         tokens = sum(r["tokens"] + 12 for r in rows)
         frame = tok(wontopos.sleep._SLEEP_DIGEST) + tok("") + tok("1: (empty)\n2: (empty)\n3: (empty)\n4: (empty)")
         sent, written = -(-(tokens + frame) * 172 // 100), -(-tokens * 7 // 100)
-        basis = {"sleep_version": "1.0.0", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": False,
+        basis = {"sleep_version": "1.0.1", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": False,
                  "margin": 0.15}
         self.assertEqual(est, {"sleep_id": "s-1", "memories": 20, "tokens": tokens, "parts": 1, "readers": 1,
                                "input_tokens": sent, "output_tokens": written,
@@ -1220,7 +1238,7 @@ class SleepCases:
             with self.subTest(speakers=speakers, dates=dates):
                 tools = mem.memory_tools("u", speakers=speakers, dates=dates, sleep=False)
                 self.assertEqual(tools_digest(tools), want)
-        tools = mem.memory_tools("u")
+        tools = mem.memory_tools("u", preset="S-2")
         self.assertNotIn("open_box", [d["name"] for d in tools.definitions()])
         with self.assertRaisesRegex(ValueError, "not a memory tool"):
             await done(tools.run({"name": "open_box", "input": {"box": "1"}}))
@@ -1229,7 +1247,7 @@ class SleepCases:
 
     async def test_memory_tools_with_sleep_carry_the_core_the_boxes_and_the_reader_note(self):
         svc, mem = self.new(self.files_service(), model="scroll-2")
-        tools = mem.memory_tools("u", sleep=True, today="2026-10-05")
+        tools = mem.memory_tools("u", preset="S-2", sleep=True, today="2026-10-05")
         base = mem.memory_tools("u").note
         if self.is_async:
             with self.assertRaisesRegex(RuntimeError, "not read yet"):
@@ -1285,7 +1303,7 @@ class SleepCases:
 
     async def test_memory_tools_with_sleep_read_the_files_at_the_first_turn_and_date_them_on_the_clock(self):
         svc, mem = self.new(self.files_service(), model="scroll-2")
-        tools = mem.memory_tools("u", sleep=True, tz=-12)
+        tools = mem.memory_tools("u", preset="S-2", sleep=True, tz=-12)
         await done(tools.begin("q"))
         self.assertEqual(paths(svc), ["self", "work/open"])
         self.assertIn("<core last edited 2026-10-01, ", tools.note)
@@ -1357,13 +1375,13 @@ class AsyncSleepTest(SleepCases, unittest.IsolatedAsyncioTestCase):
                     if not with_asyncio:
                         for module in (wontopos, wontopos.sleep):
                             stack.enter_context(mock.patch.object(module, "_asyncio_loop", return_value=None))
-                    t0 = time.monotonic()
+                    t0 = CLOCK.monotonic()
                     async with anyio.create_task_group() as tg:
                         tg.start_soon(night)
-                        while not both.is_set() and time.monotonic() - t0 < 10:
+                        while not both.is_set() and CLOCK.monotonic() - t0 < 10:
                             await anyio.sleep(0.01)
                         tg.cancel_scope.cancel()
-                    self.assertLess(time.monotonic() - t0, 2.5)
+                    self.assertLess(CLOCK.monotonic() - t0, 2.5)
                 self.assertEqual([s.aborted for s in signals], [True, True])
 
 
@@ -1387,18 +1405,18 @@ class SyncSleepCancelTest(unittest.TestCase):
                     signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
             c.signal.wait(3)
             raise ModelCallError(400, "stopped")
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(KeyboardInterrupt):
             mem.sleep("u", llm=slow, settings=SleepSettings(**SETTINGS), today="2026-09-01 23:00")
-        self.assertLess(time.monotonic() - t0, 2.5)
+        self.assertLess(CLOCK.monotonic() - t0, 2.5)
         self.assertEqual([s.aborted for s in signals], [True, True])
 
 
 
 class SleepNotesReadTest(unittest.TestCase):
 
-    def test_a_proposal_the_sleep_cannot_read_is_left_out(self):
-        from wontopos.sleep import _sleep_notes
+    def test_a_proposal_the_sleep_cannot_read_is_left_out_of_its_work_and_kept_in_its_notes_as_it_was(self):
+        from wontopos.sleep import _sleep_notes, _sleep_proposal
         good = {"id": "p1", "text": "short answers", "sleeps": 2.0, "first": 1.5, "first_day": "2026-10-01"}
         bad = [{"id": "p2", "text": "x", "first_day": "d", "first": 1}, {"id": "p3", "text": "x", "sleeps": 1, "first": 1},
                {"id": "p4", "text": "x", "sleeps": "2", "first": 1, "first_day": "d"},
@@ -1406,8 +1424,75 @@ class SleepNotesReadTest(unittest.TestCase):
                {"id": "p6", "text": "x", "sleeps": 1, "first": True, "first_day": "d"}, "p7", None]
         version, notes = _sleep_notes({"version": 3, "notes": {"proposals": [good] + bad, "mixed": []}})
         self.assertEqual(version, 3)
-        self.assertEqual(notes["proposals"], [dict(good, sleeps=2)])
+        self.assertEqual(notes["proposals"], [dict(good, sleeps=2)] + bad)
+        self.assertEqual([p for p in notes["proposals"] if _sleep_proposal(p)], [dict(good, sleeps=2)])
         self.assertIs(type(notes["proposals"][0]["sleeps"]), int)
+
+
+NOTES_FIT = [
+    ({"proposals": [{"id": "p1", "text": "a", "sleeps": 1, "first": 1, "first_day": "d", "applied": "d"}],
+      "mixed": [{"memory": "m-1", "why": "w"}]}, ["p1"], ["m-1"]),
+    ({"proposals": [
+        {"id": "p1", "text": "a" * 60_000, "sleeps": 1, "first": 1, "first_day": "d", "applied": "d"},
+        {"id": "p2", "text": "b" * 60_000, "sleeps": 1, "first": 1, "first_day": "d"},
+        {"id": "p3", "text": "c" * 60_000, "sleeps": 1, "first": 1, "first_day": "d", "applied": "d"},
+        {"id": "p4", "text": "d", "sleeps": 1, "first": 1, "first_day": "d", "applied": "d"},
+        {"id": "p5", "text": "e" * 60_000, "applied": "d"}],
+      "mixed": [{"memory": "m-1", "why": "x" * 20_000}, {"memory": "m-2", "why": "y"}]},
+     ["p2", "p4", "p5"], ["m-1", "m-2"]),
+    ({"proposals": [
+        {"id": "p1", "text": "a" * 60_000, "sleeps": 1, "first": 1, "first_day": "d", "applied": "d"},
+        {"id": "p2", "text": "b" * 150_000, "sleeps": 1, "first": 1, "first_day": "d"}],
+      "mixed": [{"memory": "m-1", "why": "x" * 60_000}, {"memory": "m-2", "why": "y"}]},
+     ["p2"], ["m-2"]),
+    ({"proposals": [{"id": "p1", "text": "b" * 250_000, "sleeps": 1, "first": 1, "first_day": "d"}],
+      "mixed": [{"memory": "m-1", "why": "y"}, {"memory": "m-2", "why": "z"}]},
+     ["p1"], []),
+]
+
+
+class SleepNotesFitTest(unittest.TestCase):
+
+    def test_over_their_cap_the_notes_drop_the_oldest_applied_proposals_then_the_oldest_marks_never_an_open_one(self):
+        from wontopos.sleep import _sleep_notes_fit
+        for notes, proposals, marks in NOTES_FIT:
+            notes = json.loads(json.dumps(notes))
+            _sleep_notes_fit(notes)
+            self.assertEqual(([p["id"] for p in notes["proposals"]], [m["memory"] for m in notes["mixed"]]),
+                             (proposals, marks))
+
+
+class SleepBoxPickTest(unittest.TestCase):
+
+    def test_a_box_is_picked_by_its_number_or_whole_name_before_part_of_one_and_never_by_a_blank(self):
+        from wontopos.sleep import _sleep_box_pick
+        view = {0: {"title": ""}, 1: {"title": "Notes on work"}, 2: {"title": "Work"}, 3: {"title": ""},
+                4: {"title": "WORK"}}
+        for which, want in (("", None), ("   ", None), (None, None), ("Work", 2), ("work", 2), ("WORK", 4),
+                            ("notes", 1), ("on wo", 1), ("2", 2), (" 4 ", 4), ("3", 3), (3, 3), ("5", None),
+                            ("Recipes", None)):
+            self.assertEqual(_sleep_box_pick(view, which), want, repr(which))
+
+
+class SleepFencedJsonTest(unittest.TestCase):
+
+    def test_the_fenced_json_is_found_in_one_pass_with_the_same_result_as_before(self):
+        from wontopos.sleep import _sleep_parse_json
+        for text, want in (('Here: ```json\n{"a": {"b": 2}}\n``` done', {"a": {"b": 2}}),
+                           ('```\n{"a": 1}\n``` and ```json {"b": 2} ```', None),
+                           ('````{"a": 1}```', {"a": 1}),
+                           ('```json\n{"a": 1}\n``` then {"b": 2}', {"a": 1}),
+                           ('```{"a": 1} no fence after it, {"b": 2}', None),
+                           ('x {"a": "}```"} y', {"a": "}```"})):
+            if want is None:
+                with self.assertRaises(ValueError, msg=text):
+                    _sleep_parse_json(text)
+            else:
+                self.assertEqual(_sleep_parse_json(text), want, text)
+        t0 = CLOCK.monotonic()
+        with self.assertRaises(ValueError):
+            _sleep_parse_json("```{}x" * 20_000)
+        self.assertLess(CLOCK.monotonic() - t0, 1)
 
 
 if __name__ == "__main__":

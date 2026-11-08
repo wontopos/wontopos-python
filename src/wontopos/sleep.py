@@ -19,10 +19,10 @@ from . import (
     _ProviderUnreachable, _TIMEOUT_ERRORS, _anyio_leave, _as_caller, _as_list, _async_sleep, _asyncio_loop, _awaited,
     _check_flag, _check_model_name, _check_whole, _cursor_repeats, _finite_float, _first_set, _is_async_callable,
     _is_int, _is_number, _is_whole, _jq, _nests_deeper, _no_constant, _provider_base, _reply_shape, _sleep_body,
-    _truncated, _with_records,
+    _time, _truncated, _with_records,
 )
 
-SLEEP_VERSION = "1.0.0"
+SLEEP_VERSION = "1.0.1"
 
 
 _SLEEP_DIGEST = """You are the sleep of {being}. While {being} sleeps, you read part {k} of {n} of what happened
@@ -289,6 +289,9 @@ class SleepSettings:
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("SleepSettings do not change: make new ones.")
 
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("SleepSettings do not change: make new ones.")
+
     def __reduce__(self) -> Any:
         return (_sleep_settings, (tuple(getattr(self, n) for n in self.__slots__),))
 
@@ -422,8 +425,41 @@ def _sleep_parts(mems: list, limit: int) -> list:
     return out
 
 
+_SLEEP_BREAK = re.compile("\r\n|[\r\n\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
+_SLEEP_CONTROL = re.compile("\r\n|[\x00-\x1f\x7f-\x9f\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
+_SLEEP_TAG = re.compile("<(?=/?(?:memories|core|boxes|box|proposals|ripe|items|section|tonight|as it stood))")
+
+
+def _sleep_untag(text: str) -> str:
+    return _SLEEP_TAG.sub("\N{SINGLE LEFT-POINTING ANGLE QUOTATION MARK}", text)
+
+
+def _sleep_shown(text: str) -> str:
+    return _sleep_untag(_SLEEP_BREAK.sub("\n    ", text))
+
+
 def _sleep_lines(mems: list) -> str:
-    return "\n".join(f"{m.eid} · {m.at} · {m.who} · {m.text}" for m in mems)
+    return "\n".join(f"{m.eid} · {m.at} · {_sleep_untag(_SLEEP_CONTROL.sub(' ', m.who))} · {_sleep_shown(m.text)}"
+                     for m in mems)
+
+
+def _sleep_heading(text: str) -> str:
+    return text.strip().lstrip("#").strip()
+
+
+def _sleep_heading_broken(e: dict, op: Any) -> bool:
+    named = [_sleep_heading(str(e.get("section") or "")), str(e.get("title") or "").strip()]
+    if op == "title":
+        named.append(str(e.get("text") or "").strip())
+    if op == "remake":
+        named += [h for h, _ in _sleep_sections(str(e.get("text") or "").strip())]
+    return any(_SLEEP_CONTROL.search(x) for x in named)
+
+
+def _sleep_speaks_of(topic: str, name: str) -> bool:
+    if not topic or not name:
+        return False
+    return topic == name or (len(name) >= 2 and topic.startswith(name)) or (len(topic) >= 3 and name.startswith(topic))
 
 
 def _sleep_number(s: str) -> Any:
@@ -431,11 +467,31 @@ def _sleep_number(s: str) -> Any:
     return int(f) if f.is_integer() and abs(f) <= _SLEEP_EXACT else f
 
 
+def _sleep_fenced(t: str) -> Optional[str]:
+    last, fence = -1, False
+    for i in range(len(t) - 1, -1, -1):
+        if t[i] == "}" and fence:
+            last = i
+            break
+        fence = t.startswith("```", i) or (fence and t[i].isspace())
+    i = t.find("```")
+    while i >= 0:
+        q = i + 3
+        if t.startswith("json", q):
+            q += 4
+        while q < len(t) and t[q].isspace():
+            q += 1
+        if t.startswith("{", q):
+            return t[q:last + 1] if last > q else None
+        i = t.find("```", i + 1)
+    return None
+
+
 def _sleep_parse_json(text: str) -> Any:
     t = text.strip()
-    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", t, re.S)
-    if m:
-        t = m.group(1)
+    fenced = _sleep_fenced(t)
+    if fenced is not None:
+        t = fenced
     i, j = t.find("{"), t.rfind("}")
     if i < 0 or j < i:
         raise ValueError("no JSON object in the answer")
@@ -465,7 +521,7 @@ def _sleep_as_lines(text: str) -> str:
 
 
 def _sleep_set_section(body: str, heading: str, text: str, raw: bool = False) -> str:
-    heading = heading.strip().lstrip("#").strip()
+    heading = _sleep_heading(heading)
     text = _sleep_demote(text.strip()) if raw else _sleep_as_lines(text)
     secs = _sleep_sections(body)
     for i, (h, _) in enumerate(secs):
@@ -531,9 +587,14 @@ def _sleep_render(view: dict, today: Any) -> str:
 
 def _sleep_box_pick(view: dict, which: Any) -> Optional[int]:
     which = str(which).strip()
-    for s in _SLEEP_BOXES:
-        title = view[s]["title"]
-        if which in (str(s), title) or (title and which.lower() in title.lower()):
+    if not which:
+        return None
+    titles = [(s, view[s]["title"]) for s in _SLEEP_BOXES]
+    for found in ((s for s, t in titles if which in (str(s), t)),
+                  (s for s, t in titles if t and which.lower() == t.lower()),
+                  (s for s, t in titles if t and which.lower() in t.lower())):
+        s = next(found, None)
+        if s is not None:
             return s
     return None
 
@@ -588,8 +649,40 @@ def _sleep_notes(r: Any) -> tuple:
     for k in ("proposals", "mixed"):
         if not isinstance(notes.get(k), list):
             notes[k] = []
-    notes["proposals"] = [dict(p, sleeps=int(p["sleeps"])) for p in notes["proposals"] if _sleep_proposal(p)]
+    notes["proposals"] = [dict(p, sleeps=int(p["sleeps"])) if _sleep_proposal(p) else p for p in notes["proposals"]]
     return (int(v) if _is_whole(v) and v >= 0 else 0), notes
+
+
+_SLEEP_PROPOSAL_ID = re.compile("p([0-9]{1,9})")
+_SLEEP_NOTES_CAP = 200_000
+
+
+def _sleep_next_id(entries: list) -> str:
+    ids = [int(m.group(1)) for p in entries if isinstance(p, dict) and isinstance(p.get("id"), str)
+           for m in [_SLEEP_PROPOSAL_ID.fullmatch(p["id"])] if m]
+    return f"p{max(ids, default=0) + 1}"
+
+
+def _sleep_size(v: Any) -> int:
+    if isinstance(v, str):
+        return len(v.encode("utf-8", "surrogatepass")) + 2
+    if isinstance(v, dict):
+        return 2 + sum(_sleep_size(str(k)) + _sleep_size(x) + 2 for k, x in v.items())
+    if isinstance(v, list):
+        return 2 + sum(_sleep_size(x) + 1 for x in v)
+    return 8
+
+
+def _sleep_notes_fit(notes: dict) -> None:
+    size = _sleep_size(notes)
+    for key in ("proposals", "mixed"):
+        keep = []
+        for x in notes[key]:
+            if size > _SLEEP_NOTES_CAP and (key == "mixed" or (_sleep_proposal(x) and x.get("applied"))):
+                size -= _sleep_size(x) + 1
+            else:
+                keep.append(x)
+        notes[key] = keep
 
 
 def _sleep_written(r: Any, writes: list) -> dict:
@@ -697,7 +790,7 @@ def _sleep_checked_items(got: Any, known: set, said: set) -> tuple:
 
 def _sleep_checked_mixed(got: Any, part: list) -> tuple:
     pos = {m.eid: i for i, m in enumerate(part)}
-    mixed, dropped = [], 0
+    mixed, dropped, keys = [], 0, set()
     for x in _sleep_iter(_sleep_answer(got).get("mixed")):
         line = str(x.get("line")) if isinstance(x, dict) else ""
         if line not in pos or not isinstance(x.get("kind"), str) or x["kind"] not in _SLEEP_MIX_KINDS:
@@ -708,9 +801,10 @@ def _sleep_checked_mixed(got: Any, part: list) -> tuple:
         mine = part[pos[line]].mine
         from_me = bool(src) and part[pos[src]].mine
         if (x["kind"] == "echo" and (mine or (src and not from_me))) or \
-                (x["kind"] == "planted" and (not mine or (src and not from_me))):
+                (x["kind"] == "planted" and (not mine or (src and not from_me))) or (line, x["kind"], src) in keys:
             dropped += 1
             continue
+        keys.add((line, x["kind"], src))
         mixed.append({"memory": part[pos[line]].mid, "at": part[pos[line]].at, "kind": x["kind"],
                       "source_memory": part[pos[src]].mid if src else None, "why": str(x.get("why") or "")[:300]})
     return mixed, dropped
@@ -759,7 +853,7 @@ def _sleep_asker(caller: Any, model: str, max_tokens: int) -> Any:
     def ask(system: str, user: str) -> Any:
         attempt = 0
         while True:
-            t0 = time.monotonic()
+            t0 = _time.monotonic()
             clock = _AskClock(_SLEEP_CALL_SECONDS)
             c = ModelCall("sleep", model, [system], user, max_tokens, signal=clock.signal)
             try:
@@ -782,7 +876,7 @@ def _sleep_asker(caller: Any, model: str, max_tokens: int) -> Any:
                 clock.close()
             u = reply["usage"] or {}
             return reply["text"], {
-                "secs": round(time.monotonic() - t0, 1),
+                "secs": round(_time.monotonic() - t0, 1),
                 "in": _sleep_usage(u, "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
                 or _sleep_usage(u, "prompt_tokens"),
                 "out": _sleep_usage(u, "output_tokens") or _sleep_usage(u, "completion_tokens"),
@@ -867,7 +961,7 @@ def _sleep_read_parts(run: _SleepRun, mems: list, core: str, titles: str) -> Any
         if failed:
             unread.append(failed)
     run.log.append({"call": "unread parts", "parts": unread})
-    return parts, lists, dropped, mixed
+    return parts, lists, dropped, mixed, unread
 
 
 def _sleep_combine(run: _SleepRun, g: list, rounds: int, known_all: set, said_all: set) -> Any:
@@ -914,10 +1008,25 @@ def _sleep_settle(run: _SleepRun, core: str, sec: str, text: str) -> Any:
     return "\n".join(held + [x for x in adds if x not in held]), f"{op}, +{len(adds)}"
 
 
+def _sleep_where(new: dict, k: int) -> str:
+    return "core" if k == 0 else f'box "{new[k]["title"]}"'
+
+
+def _sleep_cap(s: SleepSettings, k: int) -> int:
+    return s.core_tokens if k == 0 else s.box_tokens
+
+
+def _sleep_put_back(new: dict, files: dict, k: int, carried: list) -> None:
+    new[k] = dict(files[k])
+    for src, dst, sec, text in carried:
+        if dst == k and all(sec not in dict(_sleep_sections(new[j]["body"])) for j in (src, k)):
+            new[src]["body"] = _sleep_set_section(new[src]["body"], sec, text, raw=True)
+
+
 def _sleep_room(run: _SleepRun, new: dict, files: dict, k: int, used_now: int, cap: int, rooms: list,
-                refused: list, why: Optional[str] = None) -> Any:
+                refused: list, carried: list, why: Optional[str] = None) -> Any:
     me = _SLEEP_ME
-    where = "core" if k == 0 else f'box "{new[k]["title"]}"'
+    where = _sleep_where(new, k)
     core_way = ", or move people who matter less to a box (say which, under \"moved\")" if k == 0 else ""
     moved = ', "moved": [{"section": "<heading>", "to": "1|2|3|4"}]' if k == 0 else ""
     g = (yield from _sleep_ask_json(run.merge, _SLEEP_ROOM.format(being=run.being, where=where, used=used_now, cap=cap,
@@ -925,35 +1034,43 @@ def _sleep_room(run: _SleepRun, new: dict, files: dict, k: int, used_now: int, c
                                     f"<{where}>\n{new[k]['body']}\n</{where}>", f"room {k}", run.log)) or {}
     body = str(g.get("text") or "").strip()
     body = _sleep_join(_sleep_sections(body)) if body.startswith("## ") else ""
+    had = dict(_sleep_sections(new[0]["body"]))
+    moves = []
     if k == 0 and body:
-        mine = dict(_sleep_sections(new[0]["body"])).get(me)
-        if mine is None:
-            body, _ = _sleep_drop_section(body, me)
-        elif dict(_sleep_sections(body)).get(me) != mine:
+        body = _sleep_join([(h, t) for h, t in _sleep_sections(body) if h in had])
+    if k == 0 and body:
+        mine = had.get(me)
+        if mine is not None and dict(_sleep_sections(body)).get(me) != mine:
             body = _sleep_set_section(body, me, mine, raw=True)
         for mv in _sleep_iter(g.get("moved")):
             if isinstance(mv, dict) and str(mv.get("to")) in {"1", "2", "3", "4"}:
                 sec = str(mv.get("section") or "").strip()
-                held = dict(_sleep_sections(new[0]["body"])).get(sec)
-                if held is not None and sec != me and sec not in dict(_sleep_sections(body)):
-                    to = int(mv["to"])
-                    new[to]["body"] = _sleep_set_section(new[to]["body"], sec, held)
-    if body and run.count(body) <= cap:
+                held = had.get(sec)
+                if held is not None and sec != me and sec not in dict(_sleep_sections(body)) \
+                        and all(sec != s for _, s, _ in moves):
+                    moves.append((int(mv["to"]), sec, held))
+    boxes: dict = {}
+    for to, sec, held in moves:
+        boxes[to] = _sleep_set_section(boxes.get(to, new[to]["body"]), sec, held)
+    if body and run.count(body) <= cap and all(run.count(b) <= run.s.box_tokens for b in boxes.values()):
         rooms.append({"file": k, "before": used_now, "after": run.count(body)})
         new[k]["body"] = body
+        for to, b in boxes.items():
+            new[to]["body"] = b
+        carried.extend((k, to, sec, held) for to, sec, held in moves)
     else:
         rooms.append({"file": k, "before": used_now, "after": None})
         refused.append({"edit": {"file": k, "op": "room"}, "why": why or (
             f"no room: {used_now:,} of {cap:,} tokens, and the room made came back unshaped or still too big; "
             "the file stays as it was")})
-        new[k] = dict(files[k])
+        _sleep_put_back(new, files, k, carried)
 
 
-def _sleep_boxes_fit(run: _SleepRun, new: dict, files: dict, refused: list) -> None:
+def _sleep_boxes_fit(run: _SleepRun, new: dict, files: dict, refused: list, carried: list) -> None:
     for k in _SLEEP_BOXES:
         if run.count(new[k]["body"]) > run.s.box_tokens:
             refused.append({"edit": {"file": k, "op": "room"}, "why": "over its cap after a move; the box stays as it was"})
-            new[k] = dict(files[k])
+            _sleep_put_back(new, files, k, carried)
 
 
 def _sleep_seed(run: _SleepRun, files: dict, sleep_id: str, day: str) -> Any:
@@ -980,12 +1097,23 @@ def _sleep_code(e: BaseException) -> Optional[str]:
     return code if isinstance(code, str) else getattr(e, "type", None)
 
 
+def _sleep_dedupe(new: dict, deduped: list, carried: list) -> None:
+    in_core = {h for h, _ in _sleep_sections(new[0]["body"]) if h != _SLEEP_ME}
+    for k in _SLEEP_BOXES:
+        for h, _ in _sleep_sections(new[k]["body"]):
+            if h in in_core:
+                new[k]["body"], gone = _sleep_drop_section(new[k]["body"], h)
+                deduped.append({"file": k, "section": h})
+                carried.append((k, 0, h, gone))
+
+
 def _sleep_write_flow(run: _SleepRun, sleep_id: str, files: dict, new: dict, ev: list, day: str, refused: list,
-                      rooms: list) -> Any:
+                      rooms: list, carried: list, deduped: list) -> Any:
     s = run.s
     made_room: set = set()
     while True:
-        writes = [{"slot": k, "base_version": files[k]["version"], "title": new[k]["title"], "body": new[k]["body"],
+        _sleep_dedupe(new, deduped, carried)
+        writes =[{"slot": k, "base_version": files[k]["version"], "title": new[k]["title"], "body": new[k]["body"],
                    "evidence": ev, "day": day}
                   for k in _SLEEP_SLOTS if new[k]["body"] != files[k]["body"] or new[k]["title"] != files[k]["title"]]
         if not writes:
@@ -1003,13 +1131,13 @@ def _sleep_write_flow(run: _SleepRun, sleep_id: str, files: dict, new: dict, ev:
             by_slot = {w["slot"]: w for w in writes}
 
             def fill(w: dict) -> float:
-                return run.count(w["body"]) / (s.core_tokens if w["slot"] == 0 else s.box_tokens)
+                return run.count(w["body"]) / _sleep_cap(s, w["slot"])
             k = d.get("slot") if _is_int(d.get("slot")) and d.get("slot") in by_slot else max(writes, key=fill)["slot"]
-            cap = s.core_tokens if k == 0 else s.box_tokens
+            cap = _sleep_cap(s, k)
             if k in made_room:
                 refused.append({"edit": {"file": k, "op": "room"},
                                 "why": "no room: the service counts it over its cap; the file stays as it was"})
-                new[k] = dict(files[k])
+                _sleep_put_back(new, files, k, carried)
                 continue
             made_room.add(k)
             used_now = run.count(new[k]["body"])
@@ -1017,10 +1145,10 @@ def _sleep_write_flow(run: _SleepRun, sleep_id: str, files: dict, new: dict, ev:
             limit = d["cap"] if _is_int(d.get("cap")) and d.get("slot") == k else cap
             counted = _is_int(told) and told > 0 and told > limit and d.get("slot") == k
             target = limit * used_now // told if counted else min(used_now, cap) * 9 // 10
-            yield from _sleep_room(run, new, files, k, used_now, max(1, min(cap, target)), rooms, refused,
+            yield from _sleep_room(run, new, files, k, used_now, max(1, min(cap, target)), rooms, refused, carried,
                                    "no room: the service counts it over its cap, and the room made came back unshaped "
                                    "or still too big; the file stays as it was")
-            _sleep_boxes_fit(run, new, files, refused)
+            _sleep_boxes_fit(run, new, files, refused, carried)
             continue
         return _sleep_written(r, writes)
 
@@ -1031,9 +1159,13 @@ def _sleep_done_flow(run: _SleepRun, sleep_id: str) -> Any:
     return (yield ("write", "/api/v1/memory/sleep/done", {"user_id": run.store, "sleep_id": sleep_id}))
 
 
+def _sleep_titles(files: dict) -> str:
+    return "\n".join(f"{k}: {files[k]['title'] or '(empty)'}" for k in _SLEEP_BOXES)
+
+
 def _sleep_flow(run: _SleepRun) -> Any:
     s, being, me, log, count = run.s, run.being, _SLEEP_ME, run.log, run.count
-    t0 = time.monotonic()
+    t0 = _time.monotonic()
     assistant = run.assistant or _sleep_assistant((yield ("settings", run.store)))
     head, rows = yield from _sleep_read_flow(run.store, run.tz, run.since, run.sleep_id)
     sid = head.get("sleep_id")
@@ -1055,8 +1187,8 @@ def _sleep_flow(run: _SleepRun) -> Any:
     seeded = (yield from _sleep_seed(run, files, sid, day)) if run.prompt else False
     mems = _sleep_memories(rows, being, assistant, run.line_time, run.given_count)
     core = files[0]["body"]
-    titles = "\n".join(f"{k}: {files[k]['title'] or '(empty)'}" for k in _SLEEP_BOXES)
-    proposals: list = notes["proposals"]
+    titles = _sleep_titles(files)
+    proposals: list = [p for p in notes["proposals"] if _sleep_proposal(p)]
     read_tokens = sum(m.tokens for m in mems)
     run.say(f"{len(mems)} memories, {read_tokens:,} tokens → {len(_sleep_parts(mems, s.part_tokens))} readers "
             f"({s.readers} at a time)")
@@ -1071,7 +1203,7 @@ def _sleep_flow(run: _SleepRun) -> Any:
     said_all = {m.eid for m in mems if m.mine}
     by_eid = {m.eid: m for m in mems}
     span_end = mems[-1].mid
-    parts, lists, dropped, mixed = yield from _sleep_read_parts(run, mems, core, titles)
+    parts, lists, dropped, mixed, unread = yield from _sleep_read_parts(run, mems, core, titles)
     for x in mixed:
         x["sleep"] = today
     marked = {_sleep_mark_key(x) for x in notes["mixed"]}
@@ -1093,7 +1225,9 @@ def _sleep_flow(run: _SleepRun) -> Any:
     new = {k: dict(f) for k, f in files.items()}
     applied, refused, used, merge_notes, folds, settled, deduped, tidied, rooms = [], [], set(), [], [], [], [], [], []
     touched: set = set()
+    carried: list = []
     got: Any = {}
+    unmerged = False
     if items or ripe:
         blocks = "\n".join(f"<box {k} name=\"{files[k]['title'] or '(empty)'}\" size=\"{count(files[k]['body']):,} of "
                            f"{s.box_tokens:,} tokens\">\n{files[k]['body'] or '(empty)'}\n</box {k}>" for k in _SLEEP_BOXES)
@@ -1108,15 +1242,16 @@ def _sleep_flow(run: _SleepRun) -> Any:
         got = yield from _sleep_ask_json_logged(run.merge, system, user, "merge", log)
         if got is None:
             got = yield from _sleep_ask_json_logged(run.merge, system, user + _SLEEP_SHORTER, "merge shorter", log)
+        unmerged = got is None
         got = got or {}
         merge_notes = [str(x) for x in got.get("notes", [])] if isinstance(got.get("notes"), list) else []
         slot_of = {"core": 0, "0": 0, "1": 1, "2": 2, "3": 3, "4": 4}
-        ripe_ids = {p["id"] for p in ripe}
+        ripe_ids = [p["id"] for p in ripe if isinstance(p["id"], str)]
         tonight = [str(it.get("topic") or "").strip().lower() for it in items if it.get("kind") == "person"]
 
         def about_tonight(name: str) -> bool:
             n = name.strip().lower()
-            return any(n and t and (n in t or t in n) for t in tonight)
+            return any(_sleep_speaks_of(t, n) for t in tonight)
         for e in got.get("edits", []) if isinstance(got.get("edits"), list) else []:
             why = None
             if not isinstance(e, dict):
@@ -1125,13 +1260,17 @@ def _sleep_flow(run: _SleepRun) -> Any:
             op = op if isinstance(op, str) else None
             ripe_id = e.get("ripe") if isinstance(e.get("ripe"), str) else None
             ev = _sleep_eids(e.get("evidence"))
-            if slot is None or op not in {"rewrite", "remake", "move_section", "title"}:
+            made_ripe = None
+            if _sleep_heading_broken(e, op):
+                why = "a heading or a title holds a line break or a control character"
+            elif slot is None or op not in {"rewrite", "remake", "move_section", "title"}:
                 why = "unknown file or op"
             elif op in {"rewrite", "remake"} and (not ev or any(x not in known_all for x in ev)) \
                     and not (op == "rewrite" and slot == 0 and ripe_id in ripe_ids):
                 why = "no evidence, or evidence not in this sleep"
             elif op == "rewrite":
-                sec = str(e.get("section") or "").strip().lstrip("#").strip()
+                sec = _sleep_heading(str(e.get("section") or ""))
+                sec = me if slot == 0 and sec.lower() == me.lower() else sec
                 if not sec or not str(e.get("text") or "").strip():
                     why = "rewrite needs a section and text"
                 elif slot == 0 and sec == me and ripe_id not in ripe_ids:
@@ -1150,6 +1289,8 @@ def _sleep_flow(run: _SleepRun) -> Any:
                     else:
                         new[slot]["body"] = _sleep_set_section(new[slot]["body"], sec, text, raw=(slot == 0 and sec == me))
                         touched.add((slot, sec))
+                        if slot == 0 and sec == me:
+                            made_ripe = ripe_id
             elif op == "remake":
                 body = str(e.get("text") or "").strip()
                 title = str(e.get("title") or "").strip()
@@ -1165,8 +1306,8 @@ def _sleep_flow(run: _SleepRun) -> Any:
                     touched.update((slot, h) for h, _ in _sleep_sections(new[slot]["body"]))
             elif op == "move_section":
                 to = slot_of.get(str(e.get("to")))
-                sec = str(e.get("section") or "").strip().lstrip("#").strip()
-                if to is None or to == slot or (0 in (slot, to) and sec == me):
+                sec = _sleep_heading(str(e.get("section") or ""))
+                if to is None or to == slot or (0 in (slot, to) and sec.lower() == me.lower()):
                     why = "move needs another file, and the self section stays"
                 else:
                     body, text = _sleep_drop_section(new[slot]["body"], sec)
@@ -1175,6 +1316,7 @@ def _sleep_flow(run: _SleepRun) -> Any:
                     else:
                         new[slot]["body"] = body
                         new[to]["body"] = _sleep_set_section(new[to]["body"], sec, text)
+                        carried.append((slot, to, sec, text))
             elif op == "title":
                 title = str(e.get("text") or "").strip()
                 if slot == 0 or not title:
@@ -1188,22 +1330,17 @@ def _sleep_flow(run: _SleepRun) -> Any:
             else:
                 applied.append(e)
                 used.update(ev)
-                if e.get("ripe"):
+                if made_ripe is not None:
                     for p in proposals:
-                        if p["id"] == e["ripe"]:
+                        if p["id"] == made_ripe:
                             p["applied"] = today
-        in_core = {h for h, _ in _sleep_sections(new[0]["body"]) if h != me}
-        for k in _SLEEP_BOXES:
-            for h, _ in _sleep_sections(new[k]["body"]):
-                if h in in_core:
-                    new[k]["body"], _ = _sleep_drop_section(new[k]["body"], h)
-                    deduped.append({"file": k, "section": h})
+        _sleep_dedupe(new, deduped, carried)
         for k, h in sorted(touched):
             t = dict(_sleep_sections(new[k]["body"])).get(h)
             if not t or (k == 0 and h == me):
                 continue
-            where = "core" if k == 0 else f'box "{new[k]["title"]}"'
-            numbered = "\n".join(f"{i}: {ln}" for i, ln in enumerate([ln for ln in t.split("\n") if ln.strip()], 1))
+            where = _sleep_where(new, k)
+            numbered ="\n".join(f"{i}: {ln}" for i, ln in enumerate([ln for ln in t.split("\n") if ln.strip()], 1))
             g = (yield from _sleep_ask_json(run.merge, _SLEEP_TIDY.format(being=being, where=where),
                                             f"<section heading=\"{h}\">\n{numbered}\n</section>", f"tidy {k}:{h}",
                                             log)) or {}
@@ -1223,8 +1360,8 @@ def _sleep_flow(run: _SleepRun) -> Any:
                     continue
                 why = ", ".join(x for x in (f"{len(ls)} lines" if len(ls) > limit else "",
                                             f"{long} lines longer than one idea" if long else "") if x)
-                where = "core" if k == 0 else f'box "{new[k]["title"]}"'
-                g = (yield from _sleep_ask_json(run.merge, _SLEEP_FOLD_SECTION.format(being=being, where=where, why=why,
+                where = _sleep_where(new, k)
+                g =(yield from _sleep_ask_json(run.merge, _SLEEP_FOLD_SECTION.format(being=being, where=where, why=why,
                                                                                       lines=limit),
                                                 f"<section heading=\"{h}\">\n{t}\n</section>", f"fold {k}:{h}", log)) or {}
                 text = _sleep_as_lines(str(g.get("text") or ""))
@@ -1236,13 +1373,13 @@ def _sleep_flow(run: _SleepRun) -> Any:
                     refused.append({"edit": {"file": k, "op": "fold", "section": h},
                                     "why": f"fold came back unshaped or longer ({why})"})
         for k in _SLEEP_SLOTS:
-            cap = s.core_tokens if k == 0 else s.box_tokens
+            cap = _sleep_cap(s, k)
             used_now = count(new[k]["body"])
             if used_now <= cap:
                 continue
-            yield from _sleep_room(run, new, files, k, used_now, cap, rooms, refused)
-        _sleep_boxes_fit(run, new, files, refused)
-        seen_now = set()
+            yield from _sleep_room(run, new, files, k, used_now, cap, rooms, refused, carried)
+        _sleep_boxes_fit(run, new, files, refused, carried)
+        seen_now: list = []
         for p in got.get("proposals", []) if isinstance(got.get("proposals"), list) else []:
             if not isinstance(p, dict) or not str(p.get("text") or "").strip():
                 continue
@@ -1251,25 +1388,28 @@ def _sleep_flow(run: _SleepRun) -> Any:
                 refused.append({"proposal": p, "why": "a view of the being rests on something it said"})
                 continue
             text = str(p["text"]).strip()
-            same = next((q for q in proposals if q["id"] == p.get("same_as")), None)
+            same = next((q for q in proposals if isinstance(q["id"], str) and q["id"] == p.get("same_as")), None)
             if same is None:
                 same = next((q for q in proposals if counted_here(q) and q["text"] == text), None)
             if same and same["id"] not in seen_now:
                 if not counted_here(same):
                     same.update(sleeps=same["sleeps"] + 1, last_day=today, text=text, span_end=span_end)
-                seen_now.add(same["id"])
+                seen_now.append(same["id"])
             elif not same:
-                pid = f"p{len(proposals) + 1}"
-                proposals.append({"id": pid, "text": text, "sleeps": 1, "first": now,
-                                  "first_day": today, "last_day": today, "span_end": span_end})
-                seen_now.add(pid)
+                pid = _sleep_next_id(notes["proposals"])
+                made = {"id": pid, "text": text, "sleeps": 1, "first": now, "first_day": today, "last_day": today,
+                        "span_end": span_end}
+                proposals.append(made)
+                notes["proposals"].append(made)
+                seen_now.append(pid)
     ev = sorted({by_eid[e].mid for e in used if e in by_eid})
-    written = yield from _sleep_write_flow(run, sid, files, new, ev, day, refused, rooms)
+    written = yield from _sleep_write_flow(run, sid, files, new, ev, day, refused, rooms, carried, deduped)
+    _sleep_notes_fit(notes)
     if json.dumps(notes, sort_keys=True, ensure_ascii=False) != before:
         yield ("write", "/api/v1/memory/self/notes/write",
                {"user_id": run.store, "base_version": notes_version, "notes": notes})
-    ended = yield from _sleep_done_flow(run, sid)
-    secs = round(time.monotonic() - t0, 1)
+    ended = None if unread or unmerged else (yield from _sleep_done_flow(run, sid))
+    secs = round(_time.monotonic() - t0, 1)
     run.say(f"done in {secs}s · {len(items)} items · {len(applied)} edits, {len(refused)} refused · "
             f"{len(mixed)} who-said-what marks · written {sorted(written) or 'none'}")
     out.update({"readers": len(parts), "combine_rounds": rounds, "items": items, "items_dropped_by_check": dropped,
@@ -1287,7 +1427,7 @@ def _sleep_estimate_flow(run: _SleepRun, input_price: Optional[float], output_pr
     mems = _sleep_memories(rows, run.being, None, "created_at", run.given_count)
     parts = _sleep_parts(mems, run.s.part_tokens)
     tokens = sum(m.tokens for m in mems)
-    titles = "\n".join(f"{k}: {view[k]['title'] or '(empty)'}" for k in _SLEEP_BOXES)
+    titles = _sleep_titles(view)
     frame = run.count(_SLEEP_DIGEST) + run.count(view[0].get("body") or "") + run.count(titles)
     sent = -(-(tokens + len(parts) * frame) * _SLEEP_IN_PER_100 // 100)
     written = -(-tokens * _SLEEP_OUT_PER_100 // 100)
@@ -1357,7 +1497,8 @@ def _sleep_setup(client: Any, user_id: Optional[str], llm: Any, merge_llm: Any, 
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be a string, got {_jq(prompt)}.")
     if today is not None and (not isinstance(today, str) or _sleep_date(today[:10]) is None
-                              or (len(today) > 10 and not re.fullmatch(r" \d{2}:\d{2}", today[10:]))):
+                              or (len(today) > 10 and not re.fullmatch(r" \d{2}:\d{2}", today[10:]))
+                              or _sleep_when(today) is None):
         raise ValueError(f'today must be "YYYY-MM-DD HH:MM" or "YYYY-MM-DD", the sleep\'s day, got {_jq(today)}.')
     _check_flag(done, "done")
     if line_time not in ("created_at", "event_date"):
@@ -1451,29 +1592,80 @@ def _sleep_settled(aw: Any) -> Any:
     return box.get("ok")
 
 
+_SLEEP_GRACE = 0.1
+
+
+def _sleep_raced(caller: Any, c: ModelCall) -> Any:
+    clock = c.signal._clock
+    box: dict = {}
+    ended = threading.Event()
+
+    def work() -> None:
+        try:
+            got = caller.call(c)
+            box["ok"] = _sleep_settled(got) if inspect.isawaitable(got) else got
+        except BaseException as e:
+            box["error"] = e
+        finally:
+            ended.set()
+    threading.Thread(target=work, name="wontopos-sleep", daemon=True).start()
+    while not ended.wait(min(0.25, max(0.0, clock.left()))) and clock.why() is None:
+        pass
+    ended.wait(_SLEEP_GRACE)
+    if "error" in box:
+        raise box["error"]
+    if "ok" in box:
+        return box["ok"]
+    raise TimeoutError("the call ran past its time")
+
+
+async def _sleep_raced_async(aw: Any, clock: Any) -> Any:
+    if _asyncio_loop() is not None:
+        task = asyncio.ensure_future(aw)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, clock.left()))
+            if not done:
+                done, _ = await asyncio.wait({task}, timeout=_SLEEP_GRACE)
+        except BaseException:
+            task.cancel()
+            raise
+        if done:
+            return task.result()
+        task.cancel()
+    else:
+        import anyio
+
+        with anyio.move_on_after(max(0.0, clock.left()) + _SLEEP_GRACE):
+            return await aw
+    clock.expire()
+    raise TimeoutError("the call ran past its time")
+
+
+_SLEEP_SERVICE = ("post", "settings", "write")
+
+
+def _sleep_service(client: Any, need: tuple) -> Any:
+    return {"post": client._post, "settings": client.settings, "write": client._write}[need[0]](*need[1:])
+
+
 def _sleep_do_sync(client: Any, need: tuple, halt: Optional[_SleepHalt] = None) -> Any:
     kind = need[0]
-    if kind == "post":
-        return client._post(need[1], need[2])
-    if kind == "settings":
-        return client.settings(need[1])
-    if kind == "write":
-        return client._write(need[1], need[2])
+    if kind in _SLEEP_SERVICE:
+        return _sleep_service(client, need)
     if kind == "llm":
         clock = need[2].signal._clock if halt is not None else None
         if clock is not None:
             halt.calling(clock)
         try:
-            got = need[1].call(need[2])
-            return _sleep_settled(got) if inspect.isawaitable(got) else got
+            return _sleep_raced(need[1], need[2])
         finally:
             if clock is not None:
                 halt.called(clock)
     if kind == "wait":
         if halt is None:
-            time.sleep(need[1])
+            _time.sleep(need[1])
         else:
-            halt.event.wait(need[1])
+            halt.event.wait(_time.pause(need[1]))
         return None
     flows, workers = need[1], need[2]
     if not flows:
@@ -1561,23 +1753,22 @@ async def _sleep_each_async(client: Any, flows: list, workers: int) -> list:
     return [v for _, v in out]
 
 
+async def _sleep_ask_async(caller: Any, c: ModelCall) -> Any:
+    acall = getattr(caller, "_acall", None)
+    if acall is not None:
+        return await acall(c)
+    if _is_async_callable(caller.call):
+        return await caller.call(c)
+    got = await _sleep_thread(caller.call, c)
+    return await got if inspect.isawaitable(got) else got
+
+
 async def _sleep_do_async(client: Any, need: tuple) -> Any:
     kind = need[0]
-    if kind == "post":
-        return await client._post(need[1], need[2])
-    if kind == "settings":
-        return await client.settings(need[1])
-    if kind == "write":
-        return await client._write(need[1], need[2])
+    if kind in _SLEEP_SERVICE:
+        return await _sleep_service(client, need)
     if kind == "llm":
-        caller, c = need[1], need[2]
-        acall = getattr(caller, "_acall", None)
-        if acall is not None:
-            return await acall(c)
-        if _is_async_callable(caller.call):
-            return await caller.call(c)
-        got = await _sleep_thread(caller.call, c)
-        return await got if inspect.isawaitable(got) else got
+        return await _sleep_raced_async(_sleep_ask_async(need[1], need[2]), need[2].signal._clock)
     if kind == "wait":
         await _async_sleep(need[1])
         return None

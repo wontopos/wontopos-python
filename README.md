@@ -72,6 +72,15 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 
 Every method that works on a store takes a `user_id` — it names the **store**: one isolated memory space per end-user, agent, or topic, then per workspace (your API key's). WHO said each memory inside a store is the `speaker` tag below — storing the assistant's own words never needs a separate id.
 
+## Memory tools presets
+
+The memory tools have two presets on scroll-2:
+
+| Preset | For | Its first look |
+| --- | --- | --- |
+| `S-2` | measuring memory | the question alone, the assistant's own lines included |
+| `S-2-live` (default) | everyday conversation | the question with the last two lines said in the past five minutes, the assistant's own lines left out, spread across topics and time |
+
 ## Putting recall into a prompt
 
 ```python
@@ -306,7 +315,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Twelve inside 2.2 were not, deliberately and each with its
+releases are additive. Thirteen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

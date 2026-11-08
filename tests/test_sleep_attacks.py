@@ -71,9 +71,9 @@ class FixtureModel:
 
 def night_rows(n, night):
     day = night["today"][:10]
-    return [{"id": f"m{n + 1}-{i + 1}", "content": text, "created_at": f"{day}T09:{i:02d}:00Z",
-             "speaker": PERSON if who == "user" else ASSISTANT, "tokens": tok(text)}
-            for i, (who, text) in enumerate(night["memories"])]
+    return [{"id": f"m{n + 1}-{i + 1}", "content": m[1], "created_at": f"{day}T09:{i:02d}:00Z",
+             "speaker": m[2] if len(m) > 2 else PERSON if m[0] == "user" else ASSISTANT, "tokens": tok(m[1])}
+            for i, m in enumerate(night["memories"])]
 
 
 def section(body, heading):
@@ -97,9 +97,13 @@ class SleepAttackCases:
     def settings(self, scenario):
         return wontopos.SleepSettings(**{**FIX["defaults"]["settings"], **scenario.get("settings", {})})
 
-    def check_night(self, scenario, n, night, res, svc, start):
+    def check_night(self, scenario, n, night, res, svc, start, reads=()):
         where = f"{scenario['name']} night {n + 1}"
         want = night["expect"]
+        for s in want.get("read_has", []):
+            self.assertTrue(any(s in r for r in reads), f"{where}: a reader was sent {s!r}")
+        for s in want.get("read_lacks", []):
+            self.assertFalse(any(s in r for r in reads), f"{where}: no reader was sent {s!r}")
         core = svc.latest(0)["body"] if svc.latest(0) else ""
         files = [v["body"] + "\n" + v["title"] for vs in svc.slots.values() for v in vs]
         notes = json.dumps(svc.notes or {}, ensure_ascii=False)
@@ -154,9 +158,11 @@ class SleepAttackCases:
                 for n, night in enumerate(scenario["nights"]):
                     svc.give(night_rows(n, night))
                     start = len(svc.seen)
-                    res = await done(mem.sleep("u", llm=FixtureModel(night["answers"]), prompt=scenario["prompt"],
+                    model = FixtureModel(night["answers"])
+                    res = await done(mem.sleep("u", llm=model, prompt=scenario["prompt"],
                                                today=night["today"], settings=self.settings(scenario)))
-                    self.check_night(scenario, n, night, res, svc, start)
+                    reads = [user for system, user in model.calls if " you read part " in system]
+                    self.check_night(scenario, n, night, res, svc, start, reads)
 
     async def test_a_caller_that_sends_its_key_to_wontopos_is_refused_before_anything_is_sent(self):
         night = FIX["provider_night"]
@@ -318,7 +324,7 @@ class Provider:
                 pass
 
         self.srv = HTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.002}, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.srv.server_port}"
 
     def close(self):
@@ -378,6 +384,16 @@ class AsyncSleepAttackTest(SleepAttackCases, unittest.IsolatedAsyncioTestCase):
         mem = wontopos.AsyncClient(KEY, base_url=base)
         self.addAsyncCleanup(mem.aclose)
         return mem
+
+
+class SleepAttackRuleTest(unittest.TestCase):
+
+    def test_the_rule_of_the_by_name_scenario_gives_the_length_each_match_needs(self):
+        name = "a-person-is-spoken-of-by-name-not-by-a-piece-of-one"
+        rule = next(s["rule"] for s in FIX["scenarios"] if s["name"] == name)
+        for says in ("its name with something joined to its end when the name has two letters or more",
+                     "the first three letters or more of its name", "a longer topic that starts with a one-letter name"):
+            self.assertIn(says, rule)
 
 
 if __name__ == "__main__":

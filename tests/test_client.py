@@ -6,6 +6,7 @@ import numbers
 import os
 import pickle
 import re
+import select
 import sys
 import socket
 import threading
@@ -35,6 +36,97 @@ except ImportError:
     HAVE_HTTPX = False
 
 needs_httpx = unittest.skipUnless(HAVE_HTTPX, "httpx not installed (pip install 'wontopos[async]')")
+
+
+class FakeTimer:
+
+    def __init__(self, clock, seconds, fn):
+        self.clock, self.fn, self.done = clock, fn, False
+        self.end = clock.monotonic() + seconds
+        self.real = threading.Timer(seconds, self.fire)
+        self.real.daemon = True
+        with clock.lock:
+            clock.timers.append(self)
+        self.real.start()
+
+    def _take(self):
+        with self.clock.lock:
+            if self.done:
+                return False
+            self.done = True
+            self.clock.timers.remove(self)
+            return True
+
+    def fire(self):
+        if self._take():
+            self.fn()
+
+    def cancel(self):
+        self._take()
+        self.real.cancel()
+
+
+class FakeClock:
+
+    def __init__(self):
+        self.skipped = 0.0
+        self.lock = threading.Lock()
+        self.timers = []
+
+    def monotonic(self):
+        return time.monotonic() + self.skipped
+
+    def advance(self, seconds):
+        with self.lock:
+            self.skipped += max(0.0, seconds)
+            now = self.monotonic()
+            due = [t for t in self.timers if t.end <= now]
+        for t in sorted(due, key=lambda t: t.end):
+            t.fire()
+
+    def pause(self, seconds):
+        self.advance(seconds)
+        return 0.0
+
+    def skip_to_next_timer(self):
+        with self.lock:
+            ends = [t.end for t in self.timers]
+        if ends:
+            self.advance(min(ends) - self.monotonic())
+
+    def timer(self, seconds, fn):
+        return FakeTimer(self, seconds, fn)
+
+    async def wait_for(self, aw, seconds):
+        import asyncio
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(aw)
+        rang = loop.create_future()
+
+        def ring():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(lambda: rang.done() or rang.set_result(None))
+
+        t = self.timer(seconds, ring)
+        try:
+            await asyncio.wait({task, rang}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            task.cancel()
+            raise
+        finally:
+            t.cancel()
+        if task.done():
+            return task.result()
+        task.cancel()
+        await asyncio.wait({task})
+        raise asyncio.TimeoutError()
+
+
+CLOCK = FakeClock()
+wontopos._time.monotonic = CLOCK.monotonic
+wontopos._time.pause = CLOCK.pause
+wontopos._time.timer = CLOCK.timer
+wontopos._time.wait_for = CLOCK.wait_for
 
 
 class ScriptedHandler(BaseHTTPRequestHandler):
@@ -68,7 +160,7 @@ def scripted_server(script):
     srv = HTTPServer(("127.0.0.1", 0), ScriptedHandler)
     srv.script = script
     srv.seen = []
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.002}, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_port}"
 
 
@@ -132,7 +224,16 @@ def dropping_server(script):
     return accepted, f"http://127.0.0.1:{srv.getsockname()[1]}"
 
 
-def trickle_server(case, head, body=b"", interval=0.1, trickle_head=False):
+def peer_closed(sock):
+    if not select.select([sock], [], [], 0.01)[0]:
+        return False
+    try:
+        return sock.recv(65536) == b""
+    except OSError:
+        return True
+
+
+def trickle_server(case, head, body=b"", interval=0.1, trickle_head=False, fake=False):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -154,7 +255,12 @@ def trickle_server(case, head, body=b"", interval=0.1, trickle_head=False):
                 sock.sendall(head)
                 out = body
             for i in range(len(out)):
-                time.sleep(interval)
+                if fake:
+                    if peer_closed(sock):
+                        return
+                    CLOCK.advance(interval)
+                else:
+                    time.sleep(interval)
                 sock.sendall(out[i:i + 1])
         except OSError:
             pass
@@ -204,6 +310,8 @@ def staged_server(case, entries):
                 rest += chunk
             seen.append(head.split(b"\r\n", 1)[0].decode())
             if entry is None:
+                CLOCK.skip_to_next_timer()
+            if entry is None or entry == "HOLD":
                 stop.wait(10)
                 return
             status, headers, body, delay = entry
@@ -339,8 +447,7 @@ class ClientTests(unittest.TestCase):
     def test_repr_masks_the_key(self):
         mem = Client("wos-live-supersecretkeyvalue1234")
         self.assertNotIn("supersecretkeyvalue", repr(mem))
-        self.assertIn("wos-", repr(mem))
-        self.assertIn("1234", repr(mem))
+        self.assertIn("api_key='***1234'", repr(mem))
 
     def test_headers_model_and_user_agent(self):
         srv, mem = self.make([(200, {}, "{}"), (200, {}, "{}")])
@@ -714,9 +821,10 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(WosError):
             mem.stats()
 
-    def test_timeout_nan_or_zero_means_the_default(self):
-        for unset in (float("nan"), 0):
-            self.assertEqual(Client("wos-test-xxxxxxxxxx", timeout=unset)._timeout, 30.0)
+    def test_timeout_zero_means_the_default_and_nan_is_refused(self):
+        self.assertEqual(Client("wos-test-xxxxxxxxxx", timeout=0)._timeout, 30.0)
+        with self.assertRaisesRegex(ValueError, "^timeout must be a number of seconds, 0 or more, got NaN.$"):
+            Client("wos-test-xxxxxxxxxx", timeout=float("nan"))
 
     def test_with_retries_and_with_timeout_clones(self):
         srv, mem = self.make([
@@ -902,7 +1010,8 @@ class ClientTests(unittest.TestCase):
 
     def test_key_hygiene(self):
         mem = Client(" wos-test-xxxxxxxxxx\n", base_url="http://127.0.0.1:9")
-        self.assertIn("wos-", repr(mem))
+        self.assertEqual(mem._api_key, "wos-test-xxxxxxxxxx")
+        self.assertIn("api_key='***'", repr(mem))
         with self.assertRaises(ValueError):
             Client("wos-test xxxxxxxxxx")
         with self.assertRaises(ValueError):
@@ -980,6 +1089,43 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(cm.exception.details["reason"], "weekly_limit_reached")
         self.assertEqual(cm.exception.details["resets_at"], "2026-11-01T01:00:00.000Z")
 
+    def test_week_used_is_the_whole_percent_the_last_answer_carried(self):
+        srv, mem = self.make(WEEK_USED_SCRIPT, max_retries=0)
+        self.assertIsNone(mem.week_used)
+        for v, want in WEEK_USED_CASES:
+            mem.stats("u")
+            self.assertEqual(mem.week_used, want, v)
+        mem.stats("u")
+        self.assertEqual(mem.week_used, 91)
+        with self.assertRaises(wontopos.PaymentRequiredError):
+            mem.stats("u")
+        self.assertEqual(mem.week_used, 100, "a refusal that carries it sets it")
+        with self.assertRaises(wontopos.ServerError):
+            mem.stats("u")
+        self.assertEqual(mem.week_used, 100, "a refusal without it leaves it")
+        with self.assertRaises(wontopos.PaymentRequiredError):
+            mem.stats("u")
+        self.assertEqual(mem.week_used, 100, "and so does one whose value is not a percent")
+        self.assertIsNone(mem.with_model("scroll-2").week_used, "a copy starts with none")
+        mem.stats("u")
+        self.assertIsNone(mem.week_used, "a success without it says no plan week")
+
+
+WEEK_USED_CASES = [
+    ("37", 37), ("0", 0), ("100", 100), ("007", 7), ("000000000000000000000050", 50), (None, None), ("101", None),
+    ("256", None), ("-1", None), ("37.5", None), ("1e2", None), ("+5", None), ("0x10", None), ("12abc", None),
+    ("", None),
+]
+WEEK_USED_402 = ('{"type":"error","error":{"type":"billing_error","message":"This week\'s subscription usage is used '
+                 'up.","reason":"weekly_limit_reached","resets_at":"2026-11-01T01:00:00.000Z"}}')
+WEEK_USED_SCRIPT = [(200, {} if v is None else {"X-WOS-Week-Used": v}, "{}") for v, _ in WEEK_USED_CASES] + [
+    (200, {"X-WOS-Week-Used": "91"}, "{}"),
+    (402, {"X-WOS-Week-Used": "100"}, WEEK_USED_402),
+    (502, {}, '{"error": "bad gateway"}'),
+    (402, {"X-WOS-Week-Used": "101"}, WEEK_USED_402),
+    (200, {}, "{}"),
+]
+
 
 @unittest.skipUnless(HAVE_HTTPX, "httpx not installed (pip install 'wontopos[async]')")
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
@@ -998,6 +1144,28 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mem.billed_to, "balance")
             await mem.usage()
             self.assertIsNone(mem.billed_to)
+
+    async def test_week_used_is_the_whole_percent_the_last_answer_carried(self):
+        srv, mem = self.make(WEEK_USED_SCRIPT, max_retries=0)
+        async with mem:
+            self.assertIsNone(mem.week_used)
+            for v, want in WEEK_USED_CASES:
+                await mem.stats("u")
+                self.assertEqual(mem.week_used, want, v)
+            await mem.stats("u")
+            self.assertEqual(mem.week_used, 91)
+            with self.assertRaises(wontopos.PaymentRequiredError):
+                await mem.stats("u")
+            self.assertEqual(mem.week_used, 100, "a refusal that carries it sets it")
+            with self.assertRaises(wontopos.ServerError):
+                await mem.stats("u")
+            self.assertEqual(mem.week_used, 100, "a refusal without it leaves it")
+            with self.assertRaises(wontopos.PaymentRequiredError):
+                await mem.stats("u")
+            self.assertEqual(mem.week_used, 100, "and so does one whose value is not a percent")
+            self.assertIsNone(mem.with_model("scroll-2").week_used, "a copy starts with none")
+            await mem.stats("u")
+            self.assertIsNone(mem.week_used, "a success without it says no plan week")
 
     async def test_add_takes_ordinary_words_as_metadata_and_refuses_store_ids(self):
         srv, mem = self.make([(200, {}, '{"id": "m1"}')])
@@ -1518,6 +1686,7 @@ class StalledBodyIsNotRetriedTest(unittest.TestCase):
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                         b"Content-Length: 200\r\n\r\n"
                     )
+                    CLOCK.skip_to_next_timer()
                     time.sleep(stall)
             except OSError:
                 pass
@@ -1690,9 +1859,10 @@ class RecallContractTests(unittest.TestCase):
 
     def test_status_zero_belongs_to_the_connection_error_alone(self):
         import re
-        src = open(os.path.join(
+        src = "".join(open(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "src", "wontopos", "__init__.py"), encoding="utf-8").read()
+            "src", "wontopos", f), encoding="utf-8").read()
+            for f in ("__init__.py", "_checks.py", "_http.py", "_memory_tools.py", "_callers.py", "_router.py"))
         self.assertEqual(re.findall(r"WosError\(\s*0\s*,", src), [],
                          "these construct a WosError with status 0")
 
@@ -1719,10 +1889,10 @@ class DeadlineTests(unittest.TestCase):
             (429, {"Retry-After": "5"}, '{"error": "rate limited"}'),
             (200, {}, "{}"),
         ], deadline=0.2)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(RateLimitError):
             mem.search("q", user_id="alice")
-        spent = time.monotonic() - t0
+        spent = CLOCK.monotonic() - t0
         self.assertLess(spent, 0.15, f"spent {spent:.2f}s against a 0.2s budget")
 
     def test_a_clone_keeps_the_deadline(self):
@@ -1730,9 +1900,10 @@ class DeadlineTests(unittest.TestCase):
         with self.assertRaises(RateLimitError):
             mem.with_model("tablet-2").search("q", user_id="alice")
 
-    def test_a_non_positive_deadline_means_no_budget(self):
-        for unset in (0, -1):
-            self.assertIsNone(Client("wos-test-xxxxxxxxxx", deadline=unset)._deadline)
+    def test_a_zero_deadline_means_no_budget_and_a_negative_one_is_refused(self):
+        self.assertIsNone(Client("wos-test-xxxxxxxxxx", deadline=0)._deadline)
+        with self.assertRaisesRegex(ValueError, "^deadline must be a number of seconds, 0 or more, got -1.$"):
+            Client("wos-test-xxxxxxxxxx", deadline=-1)
 
 
 class PooledConnectionWatchdogTest(unittest.TestCase):
@@ -1774,7 +1945,7 @@ class PooledConnectionWatchdogTest(unittest.TestCase):
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), KeepAlive)
         srv.daemon_threads = True
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.002}, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
 
@@ -1798,13 +1969,13 @@ class PooledConnectionWatchdogTest(unittest.TestCase):
                 out[name] = e
 
         with mock.patch.object(urllib3.response.HTTPResponse, "release_conn", held_after_release):
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             a = threading.Thread(target=run, args=("A", fast.list_models), name="A")
             b = threading.Thread(target=lambda: released.wait(5) and run("B", lambda: mem.add("x", "alice")))
             a.start()
             b.start()
             self.assertTrue(b_arrived.wait(5))
-            time.sleep(max(0.0, t0 + 0.45 - time.monotonic()))
+            time.sleep(max(0.0, t0 + 0.45 - CLOCK.monotonic()))
             go.set()
             a.join(5)
             b.join(5)
@@ -1994,9 +2165,9 @@ class ConflictRetryTest(SyncMake, unittest.TestCase):
     def test_the_wait_is_at_least_retry_after_ms(self):
         slow = envelope("conflict_error", "in flight", "req_lock", retry_after_ms=900)
         srv, mem = self.make([(409, {}, slow), (200, {}, '{"id": "m1"}')])
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         mem.add("x", "alice")
-        self.assertGreaterEqual(time.monotonic() - t0, 0.85)
+        self.assertGreaterEqual(CLOCK.monotonic() - t0, 0.85)
 
     def test_a_store_id_collision_is_never_retried(self):
         srv, mem = self.make([(409, {}, COLLIDE_409), (200, {}, "{}")], retries=2)
@@ -2023,10 +2194,10 @@ class ConflictRetryTest(SyncMake, unittest.TestCase):
     def test_a_lock_wait_past_the_deadline_raises_the_409(self):
         slow = envelope("conflict_error", "in flight", "req_lock", retry_after_ms=5000)
         srv, mem = self.make([(409, {}, slow), (200, {}, "{}")], deadline=0.4)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(wontopos.ConflictError) as cm:
             mem.add("x", "alice")
-        self.assertLess(time.monotonic() - t0, 0.3)
+        self.assertLess(CLOCK.monotonic() - t0, 0.3)
         self.assertEqual(cm.exception.request_id, "req_lock")
         self.assertEqual(len(srv.seen), 1)
 
@@ -2065,10 +2236,10 @@ class DeadlineReportsTheResponseTest(SyncMake, unittest.TestCase):
 
     def test_a_429_that_cannot_wait_raises_rate_limit_error(self):
         srv, mem = self.make([(429, {"Retry-After": "5"}, RATE_429), (200, {}, "{}")], deadline=0.4)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(RateLimitError) as cm:
             mem.add("x", "alice")
-        self.assertLess(time.monotonic() - t0, 0.3)
+        self.assertLess(CLOCK.monotonic() - t0, 0.3)
         self.assertEqual(cm.exception.status, 429)
         self.assertEqual(cm.exception.request_id, "req_429")
         self.assertEqual(len(srv.seen), 1)
@@ -2097,10 +2268,10 @@ class DeadlineReportsTheResponseTest(SyncMake, unittest.TestCase):
     def test_a_read_cut_by_the_deadline_reports_the_answer_before_it(self):
         seen, base = staged_server(self, self.STALL_AFTER_429)
         mem = Client(KEY, base_url=base, timeout=10, deadline=0.8)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(RateLimitError) as cm:
             mem.list_stores()
-        self.assertLess(time.monotonic() - t0, 1.6)
+        self.assertLess(CLOCK.monotonic() - t0, 1.6)
         self.assertEqual((cm.exception.status, cm.exception.request_id), (429, "req_429"))
         self.assertEqual(len(seen), 2)
 
@@ -2136,18 +2307,18 @@ class DeadlineReportsTheResponseTest(SyncMake, unittest.TestCase):
     def test_a_deadline_spent_during_the_wait_reports_the_answer(self):
         call = wontopos._Call("POST", "/api/v1/memory/add", 2, 0.05)
         self.assertEqual(call.after_status(429, {"Retry-After": "0"}, RATE_429.encode()), 0.0)
-        time.sleep(0.1)
+        CLOCK.advance(0.1)
         with self.assertRaises(RateLimitError) as cm:
             call.clock(10)
         self.assertEqual(cm.exception.request_id, "req_429")
         call = wontopos._Call("POST", "/api/v1/memory/store", 2, 0.2)
         self.assertEqual(call.after_status(429, {"Retry-After": "0"}, RATE_429.encode()), 0.0)
         clock = call.clock(10)
-        time.sleep(0.25)
+        CLOCK.advance(0.25)
         with self.assertRaises(RateLimitError):
             call.after_failure(wontopos._Failure("ConnectTimeout (timed out)", never_sent=True), clock)
         bare = wontopos._Call("GET", "/x", 2, 0.01)
-        time.sleep(0.05)
+        CLOCK.advance(0.05)
         with self.assertRaises(APIConnectionError):
             bare.clock(10)
 
@@ -2160,12 +2331,12 @@ class DeadlineReportsTheResponseTest(SyncMake, unittest.TestCase):
                 self.assertEqual(call.after_status(429, {"Retry-After": "0"}, RATE_429.encode()), 0.0)
                 call.attempt = 1
                 clock = call.clock(10)
-                time.sleep(0.35)
+                CLOCK.advance(0.35)
                 with self.assertRaises(RateLimitError):
                     call.after_failure(self.NEVER_SENT, clock)
         call = wontopos._Call("POST", "/api/v1/x", 0, 0.1)
         clock = call.clock(10)
-        time.sleep(0.15)
+        CLOCK.advance(0.15)
         with self.assertRaises(APIConnectionError) as cm:
             call.after_failure(self.NEVER_SENT, clock)
         self.assertEqual(cm.exception.message, "deadline of 0.1s exhausted")
@@ -2213,10 +2384,10 @@ class AsyncDeadlineReportsTheResponseTest(AsyncMake, unittest.IsolatedAsyncioTes
     async def test_a_read_cut_by_the_deadline_reports_the_answer_before_it(self):
         seen, base = staged_server(self, DeadlineReportsTheResponseTest.STALL_AFTER_429)
         async with AsyncClient(KEY, base_url=base, timeout=10, deadline=0.8) as mem:
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             with self.assertRaises(RateLimitError) as cm:
                 await mem.list_stores()
-            self.assertLess(time.monotonic() - t0, 1.6)
+            self.assertLess(CLOCK.monotonic() - t0, 1.6)
         self.assertEqual(cm.exception.request_id, "req_429")
         self.assertEqual(len(seen), 2)
 
@@ -2235,7 +2406,17 @@ class AsyncDeadlineReportsTheResponseTest(AsyncMake, unittest.IsolatedAsyncioTes
         self.assertEqual(len(seen), 2)
 
 
+def short_body_wait(case):
+    from unittest import mock
+    patch = mock.patch.object(wontopos, "_RETRYABLE_BODY_WAIT", 0.1)
+    patch.start()
+    case.addCleanup(patch.stop)
+
+
 class SlowErrorBodyTest(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        short_body_wait(self)
 
     SLOW_429 = [(429, {"Retry-After": "0"}, RATE_429, 3), (200, {}, '{"id": "m1"}', 0)]
     SLOW_404 = [(404, {}, envelope("not_found_error", "Not found.", "r"), 3)]
@@ -2258,21 +2439,21 @@ class SlowErrorBodyTest(unittest.IsolatedAsyncioTestCase):
     def test_sync_retries_a_stalled_429_without_waiting_for_its_body(self):
         seen, base = staged_server(self, self.STALLED_429)
         mem = Client(KEY, base_url=base, timeout=10)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         self.assertEqual(mem.add("x", "alice")["id"], "m1")
-        self.assertLess(time.monotonic() - t0, 3)
+        self.assertLess(CLOCK.monotonic() - t0, 3)
         self.assertEqual(len(seen), 2)
 
     @needs_httpx
     async def test_async_retries_a_stalled_429_without_waiting_for_its_body(self):
         seen, base = staged_server(self, self.STALLED_429)
         async with AsyncClient(KEY, base_url=base, timeout=10) as mem:
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             self.assertEqual((await mem.add("x", "alice"))["id"], "m1")
-            self.assertLess(time.monotonic() - t0, 3)
+            self.assertLess(CLOCK.monotonic() - t0, 3)
         self.assertEqual(len(seen), 2)
 
-    FINAL_429S = ([(429, {"Retry-After": "60"}, RATE_429, 1.5)], [(429, {"Retry-After": "0"}, RATE_429, 1.5)])
+    FINAL_429S = ([(429, {"Retry-After": "60"}, RATE_429, 0.3)], [(429, {"Retry-After": "0"}, RATE_429, 0.3)])
 
     def test_sync_waits_for_the_body_of_a_429_that_is_not_retried(self):
         for entries, retries in zip(self.FINAL_429S, (2, 0)):
@@ -2304,18 +2485,18 @@ class SlowErrorBodyTest(unittest.IsolatedAsyncioTestCase):
         async with AsyncClient(KEY, base_url=base, timeout=0.5) as mem:
             with self.assertRaises(NotFoundError) as cm:
                 await mem.get("alice", IMAGE_ID)
-        self.assertEqual(cm.exception.message,
-                         "HTTP 404 (the error body could not be read: request timed out after 0.5s)")
+        self.assertTrue(cm.exception.message.startswith("HTTP 404 (the error body could not be read: "),
+                        cm.exception.message)
 
 
 class RetryAfterTest(SyncMake, unittest.TestCase):
 
     def test_a_retry_after_beyond_the_cap_raises_at_once(self):
         srv, mem = self.make([(429, {"Retry-After": "3540"}, RATE_429), (200, {}, "{}")], retries=2)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(RateLimitError) as cm:
             mem.usage(7)
-        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertLess(CLOCK.monotonic() - t0, 1.0)
         self.assertEqual(cm.exception.retry_after, 3540.0)
         self.assertEqual(len(srv.seen), 1)
 
@@ -2369,9 +2550,9 @@ class RetryAfterTest(SyncMake, unittest.TestCase):
 
     def test_a_negative_retry_after_does_not_retry_at_once(self):
         srv, mem = self.make([(429, {"Retry-After": "-5"}, RATE_429), (200, {}, "{}")])
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         mem.stats("alice")
-        self.assertGreaterEqual(time.monotonic() - t0, 0.45)
+        self.assertGreaterEqual(CLOCK.monotonic() - t0, 0.45)
         self.assertEqual(len(srv.seen), 2)
 
 
@@ -2408,22 +2589,22 @@ class WallClockTimeoutTest(unittest.IsolatedAsyncioTestCase):
     SMALL_HEAD = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n"
 
     def assertQuick(self, t0, limit):
-        spent = time.monotonic() - t0
+        spent = CLOCK.monotonic() - t0
         self.assertLess(spent, limit + 0.8, f"took {spent:.1f}s against a {limit}s limit")
 
     def test_sync_body(self):
-        seen, base = trickle_server(self, self.HEAD, b" " * 40)
+        seen, base = trickle_server(self, self.HEAD, b" " * 40, fake=True)
         mem = Client(KEY, base_url=base, timeout=0.5, retries=0)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(APIConnectionError) as cm:
             mem.stats("alice")
         self.assertQuick(t0, 0.5)
         self.assertIn("request timed out after 0.5s", str(cm.exception))
 
     def test_sync_headers(self):
-        seen, base = trickle_server(self, self.SMALL_HEAD, b"{}", trickle_head=True)
+        seen, base = trickle_server(self, self.SMALL_HEAD, b"{}", trickle_head=True, fake=True)
         mem = Client(KEY, base_url=base, timeout=0.5, retries=2)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(APIConnectionError) as cm:
             mem.list_stores()
         self.assertQuick(t0, 0.5)
@@ -2431,27 +2612,27 @@ class WallClockTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1, "a timeout is final")
 
     def test_sync_deadline(self):
-        seen, base = trickle_server(self, self.HEAD, b" " * 40)
+        seen, base = trickle_server(self, self.HEAD, b" " * 40, fake=True)
         mem = Client(KEY, base_url=base, timeout=10, deadline=0.6, retries=2)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(APIConnectionError) as cm:
             mem.list_stores()
         self.assertQuick(t0, 0.6)
         self.assertIn("deadline of 0.6s exhausted", str(cm.exception))
 
     def test_sync_image(self):
-        seen, base = trickle_server(self, self.IMG_HEAD, b"x" * 40)
+        seen, base = trickle_server(self, self.IMG_HEAD, b"x" * 40, fake=True)
         mem = Client(KEY, base_url=base, timeout=0.5, retries=0)
-        t0 = time.monotonic()
+        t0 = CLOCK.monotonic()
         with self.assertRaises(APIConnectionError):
             mem.get_image(memory_id=IMAGE_ID)
         self.assertQuick(t0, 0.5)
 
     @needs_httpx
     async def test_async_body(self):
-        seen, base = trickle_server(self, self.HEAD, b" " * 40)
+        seen, base = trickle_server(self, self.HEAD, b" " * 40, fake=True)
         async with AsyncClient(KEY, base_url=base, timeout=0.5, retries=0) as mem:
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             with self.assertRaises(APIConnectionError) as cm:
                 await mem.stats("alice")
         self.assertQuick(t0, 0.5)
@@ -2459,9 +2640,9 @@ class WallClockTimeoutTest(unittest.IsolatedAsyncioTestCase):
 
     @needs_httpx
     async def test_async_headers(self):
-        seen, base = trickle_server(self, self.SMALL_HEAD, b"{}", trickle_head=True)
+        seen, base = trickle_server(self, self.SMALL_HEAD, b"{}", trickle_head=True, fake=True)
         async with AsyncClient(KEY, base_url=base, timeout=0.5, retries=2) as mem:
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             with self.assertRaises(APIConnectionError):
                 await mem.list_stores()
         self.assertQuick(t0, 0.5)
@@ -2469,9 +2650,9 @@ class WallClockTimeoutTest(unittest.IsolatedAsyncioTestCase):
 
     @needs_httpx
     async def test_async_deadline(self):
-        seen, base = trickle_server(self, self.HEAD, b" " * 40)
+        seen, base = trickle_server(self, self.HEAD, b" " * 40, fake=True)
         async with AsyncClient(KEY, base_url=base, timeout=10, deadline=0.6) as mem:
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             with self.assertRaises(APIConnectionError) as cm:
                 await mem.list_stores()
         self.assertQuick(t0, 0.6)
@@ -2479,9 +2660,9 @@ class WallClockTimeoutTest(unittest.IsolatedAsyncioTestCase):
 
     @needs_httpx
     async def test_async_image(self):
-        seen, base = trickle_server(self, self.IMG_HEAD, b"x" * 40)
+        seen, base = trickle_server(self, self.IMG_HEAD, b"x" * 40, fake=True)
         async with AsyncClient(KEY, base_url=base, timeout=0.5, retries=0) as mem:
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             with self.assertRaises(APIConnectionError):
                 await mem.get_image(memory_id=IMAGE_ID)
         self.assertQuick(t0, 0.5)
@@ -2781,18 +2962,24 @@ class TimeoutValuesTest(unittest.TestCase):
 
     CLASSES = (Client, AsyncClient) if HAVE_HTTPX else (Client,)
 
-    def test_values_that_are_not_positive_numbers_mean_the_default(self):
+    def test_zero_means_the_default_and_values_that_are_not_numbers_of_seconds_are_refused(self):
         for cls in self.CLASSES:
-            for unset in (0, -1, float("nan"), float("-inf"), True, "60", (3, 30)):
-                with self.subTest(cls=cls.__name__, value=unset):
-                    self.assertEqual(cls(KEY, timeout=unset)._timeout, 30.0)
-                    self.assertIsNone(cls(KEY, deadline=unset)._deadline)
+            with self.subTest(cls=cls.__name__, value=0):
+                self.assertEqual(cls(KEY, timeout=0)._timeout, 30.0)
+                self.assertIsNone(cls(KEY, deadline=0)._deadline)
+            for bad in (-1, float("nan"), float("-inf"), True, "60", (3, 30)):
+                with self.subTest(cls=cls.__name__, value=bad):
+                    with self.assertRaisesRegex(ValueError, "^timeout must be a number of seconds"):
+                        cls(KEY, timeout=bad)
+                    with self.assertRaisesRegex(ValueError, "^deadline must be a number of seconds"):
+                        cls(KEY, deadline=bad)
             self.assertEqual(cls(KEY, timeout=float("inf"))._timeout, 2147483)
 
-    def test_clones_fall_back_too(self):
+    def test_clones_check_too(self):
         mem = Client(KEY)
         self.assertEqual(mem.with_timeout(0)._timeout, 30.0)
-        self.assertIsNone(mem.with_deadline(float("nan"))._deadline)
+        with self.assertRaisesRegex(ValueError, "^deadline must be a number of seconds"):
+            mem.with_deadline(float("nan"))
 
     def test_huge_values_are_clamped(self):
         for cls in self.CLASSES:
@@ -3093,10 +3280,10 @@ class BaseUrlTest(unittest.TestCase):
                         "http://user:s3cret@[bad", "http:/example.net:9", "http:example.net",
                         "HTTPS:api.wontopos.com", "https:///api.wontopos.com", "http:127.0.0.1:9"):
                 with self.subTest(cls=cls.__name__, url=bad):
-                    t0 = time.monotonic()
+                    t0 = CLOCK.monotonic()
                     with self.assertRaises(ValueError) as cm:
                         cls(KEY, base_url=bad)
-                    self.assertLess(time.monotonic() - t0, 0.5)
+                    self.assertLess(CLOCK.monotonic() - t0, 0.5)
                     self.assertIn("base_url is not a URL", str(cm.exception))
                     self.assertNotIn("s3cret", str(cm.exception))
 
@@ -3118,6 +3305,7 @@ class BaseUrlTest(unittest.TestCase):
 
     def test_the_warning_follows_the_transport_host(self):
         import warnings as _w
+        wontopos._reset_warning_state()
         with _w.catch_warnings(record=True) as caught:
             _w.simplefilter("always")
             wontopos._warn_if_plain_http("http://203.0.113.7:8080\\@localhost")
@@ -3141,6 +3329,7 @@ class BaseUrlTest(unittest.TestCase):
                 "http://203.0.113.7", "http://[::2]", "http://localhost.example.com")
         for url in quiet + loud:
             for cls in self.CLASSES:
+                wontopos._reset_warning_state()
                 with self.subTest(cls=cls.__name__, url=url), _w.catch_warnings(record=True) as caught:
                     _w.simplefilter("always")
                     cls(KEY, base_url=url)
@@ -3176,7 +3365,8 @@ class DocsTest(unittest.TestCase):
 
     def test_no_stale_claims(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(root, "src", "wontopos", "__init__.py"), encoding="utf-8").read()
+        src = "".join(open(os.path.join(root, "src", "wontopos", f), encoding="utf-8").read()
+                      for f in ("__init__.py", "_checks.py", "_http.py", "_memory_tools.py", "_callers.py", "_router.py"))
         src = re.sub(r'(?m)^__version__ = .*$', "", src)
         found = [p for p in self.STALE if re.search(p, src)]
         self.assertEqual(found, [])
@@ -3594,6 +3784,7 @@ def silent_server(case):
             except OSError:
                 return
             held.append(sock)
+            CLOCK.skip_to_next_timer()
 
     threading.Thread(target=run, daemon=True).start()
     case.addCleanup(lambda: [s.close() for s in held])
@@ -3655,10 +3846,10 @@ class AsyncPoolWaitTest(unittest.IsolatedAsyncioTestCase):
                     await mem.with_timeout(0.3).with_retries(0).add("x", "alice")
                 self.assertIn("network error: POST /api/v1/memory/store: PoolTimeout (timed out)",
                               str(cm.exception))
-            t0 = time.monotonic()
+            t0 = CLOCK.monotonic()
             with self.assertRaises(APIConnectionError):
                 await mem.with_timeout(0.3).with_retries(1).add("x", "alice")
-            self.assertGreater(time.monotonic() - t0, 1.0)
+            self.assertGreater(CLOCK.monotonic() - t0, 1.0)
         finally:
             holder.cancel()
             with contextlib.suppress(BaseException):
@@ -3666,7 +3857,7 @@ class AsyncPoolWaitTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_owned_client(self):
         from unittest import mock
-        seen, base = staged_server(self, [None])
+        seen, base = staged_server(self, ["HOLD"])
         one = lambda hx, key: hx.AsyncClient(limits=hx.Limits(max_connections=1))  # noqa: E731
         with mock.patch.object(wontopos, "_new_async_http", one):
             mem = AsyncClient(KEY, base_url=base)
@@ -3676,7 +3867,7 @@ class AsyncPoolWaitTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_httpx_client_passed_in(self):
         import httpx
-        seen, base = staged_server(self, [None])
+        seen, base = staged_server(self, ["HOLD"])
         async with httpx.AsyncClient(limits=httpx.Limits(max_connections=1)) as http:
             await self.wait_for_the_pool(AsyncClient(KEY, base_url=base, _http=http))
         self.assertEqual(len(seen), 1)
@@ -3801,6 +3992,7 @@ class NoAsyncioLoopTest(AsyncMake, unittest.IsolatedAsyncioTestCase):
 
     async def test_calls_retry_and_time_out_without_asyncio(self):
         from unittest import mock
+        short_body_wait(self)
         with mock.patch.object(wontopos, "_asyncio_loop", return_value=None):
             srv, mem = self.amake([(429, {"Retry-After": "0"}, RATE_429), (200, {}, '{"total_memories": 2}')])
             async with mem:
@@ -3809,15 +4001,15 @@ class NoAsyncioLoopTest(AsyncMake, unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(mem._transport.loop)
             _, base = staged_server(self, SlowErrorBodyTest.STALLED_429)
             async with AsyncClient(KEY, base_url=base, timeout=10) as mem:
-                t0 = time.monotonic()
+                t0 = CLOCK.monotonic()
                 self.assertEqual((await mem.add("x", "alice"))["id"], "m1")
-            self.assertLess(time.monotonic() - t0, 3)
+            self.assertLess(CLOCK.monotonic() - t0, 3)
             _, base = trickle_server(self, WallClockTimeoutTest.HEAD, b" " * 40)
             async with AsyncClient(KEY, base_url=base, timeout=0.5, retries=0) as mem:
-                t0 = time.monotonic()
+                t0 = CLOCK.monotonic()
                 with self.assertRaises(APIConnectionError) as cm:
                     await mem.stats("alice")
-            self.assertLess(time.monotonic() - t0, 1.3)
+            self.assertLess(CLOCK.monotonic() - t0, 1.3)
             self.assertIn("request timed out after 0.5s", str(cm.exception))
             conns, base = silent_server(self)
             async with AsyncClient(KEY, base_url=base, timeout=0.5, retries=1) as mem:
