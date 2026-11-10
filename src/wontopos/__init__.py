@@ -33,7 +33,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.50"
+__version__ = "2.2.51"
 
 __all__ = [
     "Client", "AsyncClient", "WME", "MemoryTools", "AsyncMemoryTools",
@@ -1220,6 +1220,8 @@ class Client(_MemoryCalls, _ImageCalls, _SpeakerCalls, _WorkCalls, _MemoryToolsC
         """Release the HTTP connection pool this client opened; a copy leaves the one it shares open."""
         if self._owns_session:
             self._session.close()
+            for caller in self._router.built:
+                caller.close()
 
     def __enter__(self) -> "Client":
         return self

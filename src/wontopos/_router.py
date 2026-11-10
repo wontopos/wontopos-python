@@ -203,6 +203,7 @@ class _RouterState:
         self.skills = _SkillRegistry()
         self.handlers: dict = {}
         self.callers: dict = {}
+        self.built: list = []
         self._tokens: dict = {}
         self._answers: dict = {}
         self._windows: dict = {}
@@ -218,7 +219,9 @@ class _RouterState:
             if key == wontopos_key:
                 raise ValueError(f"{what} is this client's Wontopos key: a Wontopos key never goes to a model provider. "
                                  "Give the provider's own key.")
-            return _AnthropicCaller(key, _provider_url(provider_base, wontopos_base), None, "5m")
+            made = _AnthropicCaller(key, _provider_url(provider_base, wontopos_base), None, "5m")
+            self.built.append(made)
+            return made
 
         def own(c: Any, what: str) -> Any:
             caller = _as_caller(c, what)
@@ -418,11 +421,15 @@ def _router_turn(exchanges: list, clock: _RouterClock, now: float, name: Optiona
     return "\n\n".join(parts)
 
 
+_INPUT_BREAKS = {0x85: "\\u0085", 0x2028: "\\u2028", 0x2029: "\\u2029"}
+
+
 def _skill_list(skills: list) -> str:
     T = _ROUTER_TEXT
     lines = [T["skills"]]
     for s in skills:
-        lines.append(f"- {s['name']}: {_kept_in(s['description'])}\n  {T['skillInput']} {_js_json(s['input'])}")
+        shown = _js_json(s["input"]).translate(_INPUT_BREAKS)
+        lines.append(f"- {s['name']}: {_kept_in(s['description'])}\n  {T['skillInput']} {shown}")
     return "\n".join(lines)
 
 
@@ -1295,13 +1302,15 @@ def _ask_flow(client: Any, request: Any, user_id: Optional[str], turn: Any, spea
     started = _time.monotonic()
     try:
         exchanges: list = []
+        no_channel = False
         if use_history:
             ok, got = yield ("post", "/api/v1/memory/channel/read", _channel_read_body(store, speaker), run)
             if ok:
                 exchanges = _exchanges(got)
                 hist["read"] = "ok"
             else:
-                hist["read"] = "failed"
+                no_channel = isinstance(got, WosError) and got.status in _NO_CHANNEL
+                hist["read"] = "skipped" if no_channel else "failed"
         if run.why():
             return refuse(run.failure())
         d = yield from _router_decide_flow(client, store, request, exchanges, clock, run, usage)
@@ -1317,7 +1326,7 @@ def _ask_flow(client: Any, request: Any, user_id: Optional[str], turn: Any, spea
             at = {"action": "skill", "skill": d["def"]["name"], "input": d["input"]}
             result = refuse(ran, **at) if isinstance(ran, _Fail) else end({"ok": True, **at, **ran})
         if use_history:
-            if run.why() or run.left() <= 0:
+            if no_channel or run.why() or run.left() <= 0:
                 hist["pushed"] = "skipped"
             else:
                 body = _channel_read_body(store, None)

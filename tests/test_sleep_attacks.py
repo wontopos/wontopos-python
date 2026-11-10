@@ -27,6 +27,8 @@ def expand(v):
         return {k: expand(x) for k, x in v.items()}
     if isinstance(v, list):
         return [expand(x) for x in v]
+    if isinstance(v, str):
+        return v.replace("@@ASSISTANT@@", ASSISTANT)
     return v
 
 
@@ -97,13 +99,20 @@ class SleepAttackCases:
     def settings(self, scenario):
         return wontopos.SleepSettings(**{**FIX["defaults"]["settings"], **scenario.get("settings", {})})
 
-    def check_night(self, scenario, n, night, res, svc, start, reads=()):
+    def check_night(self, scenario, n, night, res, svc, start, reads=(), calls=()):
         where = f"{scenario['name']} night {n + 1}"
         want = night["expect"]
         for s in want.get("read_has", []):
             self.assertTrue(any(s in r for r in reads), f"{where}: a reader was sent {s!r}")
         for s in want.get("read_lacks", []):
             self.assertFalse(any(s in r for r in reads), f"{where}: no reader was sent {s!r}")
+        for s in want.get("calls_have", []):
+            self.assertTrue(any(s in c for c in calls), f"{where}: a model call held {s!r}")
+        for s in want.get("calls_lack", []):
+            self.assertFalse(any(s in c for c in calls), f"{where}: no model call held {s!r}")
+        latest = [svc.latest(k)["body"] for k in svc.slots if svc.latest(k)]
+        for s in want.get("files_have", []):
+            self.assertTrue(any(s in f for f in latest), f"{where}: a file holds {s!r}")
         core = svc.latest(0)["body"] if svc.latest(0) else ""
         files = [v["body"] + "\n" + v["title"] for vs in svc.slots.values() for v in vs]
         notes = json.dumps(svc.notes or {}, ensure_ascii=False)
@@ -155,6 +164,10 @@ class SleepAttackCases:
                 before = scenario.get("before", {})
                 if "proposals" in before:
                     svc.notes = {"proposals": json.loads(json.dumps(before["proposals"])), "mixed": []}
+                for k, f in before.get("files", {}).items():
+                    svc.slots[int(k)].append({"version": 1, "title": f.get("title", ""), "body": f["body"],
+                                              "tokens": tok(f["body"]), "evidence": [], "day": f.get("day"),
+                                              "sleep_id": None})
                 for n, night in enumerate(scenario["nights"]):
                     svc.give(night_rows(n, night))
                     start = len(svc.seen)
@@ -162,7 +175,8 @@ class SleepAttackCases:
                     res = await done(mem.sleep("u", llm=model, prompt=scenario["prompt"],
                                                today=night["today"], settings=self.settings(scenario)))
                     reads = [user for system, user in model.calls if " you read part " in system]
-                    self.check_night(scenario, n, night, res, svc, start, reads)
+                    calls = [system + "\n" + user for system, user in model.calls]
+                    self.check_night(scenario, n, night, res, svc, start, reads, calls)
 
     async def test_a_caller_that_sends_its_key_to_wontopos_is_refused_before_anything_is_sent(self):
         night = FIX["provider_night"]

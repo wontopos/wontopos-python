@@ -27,7 +27,7 @@ RESULTS = [
 ]
 PLAIN = b'{"user_id":"u","question":"what did we plan"}'
 LATER = [b'{"user_id":"u","work_id":"w-1"}', b'{"user_id":"u","work_id":"w-1","query":"the cake"}']
-OTHERS = ',"filters":{"source_types":["user_said","ai_thought","inferred","system"]}'
+OTHERS = ',"own_words":false'
 LIVE = OTHERS + ',"diversity":"full"'
 
 
@@ -120,7 +120,8 @@ class S2LiveCases:
         self.assertEqual(await self.turn(mem.memory_tools("u")), RESULTS)
         self.assertEqual([s["path"] for s in srv.seen], [HISTORY, WORK + "open", WORK + "deeper", WORK + "search"])
         opened = json.loads(srv.seen[1]["body"])
-        self.assertEqual(opened["filters"], {"source_types": ["user_said", "ai_thought", "inferred", "system"]})
+        self.assertIs(opened["own_words"], False)
+        self.assertNotIn("filters", opened)
         self.assertEqual(opened["diversity"], "full")
         self.assertEqual(srv.seen[1]["body"], asked("we booked the cabin\n" + Q))
         self.assertEqual([s["body"] for s in srv.seen[2:]], LATER)

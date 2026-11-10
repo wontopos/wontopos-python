@@ -939,8 +939,8 @@ class RouterCases:
                 await self.add(mem, WEB)
                 r = await done(mem.ask("Weather tomorrow?"))
                 self.assertEqual((r["ok"], r["skill"], r["text"]), (True, "lookup", "Sunny."))
-                self.assertEqual(r["history"], {"read": "failed", "pushed": "failed"})
-                self.assertEqual(engine.paths(), ["/api/v1/memory/channel/read", "/api/v1/memory/channel/push"])
+                self.assertEqual(r["history"], {"read": "skipped", "pushed": "skipped"})
+                self.assertEqual(engine.paths(), ["/api/v1/memory/channel/read"], "no push follows a read that found no channel")
 
     async def test_ask_returns_its_result_when_the_push_answers_404(self):
         engine = self.engine(push_status=404)

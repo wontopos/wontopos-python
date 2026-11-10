@@ -32,18 +32,18 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 | Method | What it does |
 |---|---|
 | **Write** | |
-| `add(content, user_id, **metadata)` | Store one memory. Alias `store`. `image=` attaches a photo. |
+| `add(content, user_id, **metadata)` | Store one memory. Alias `store`. `image=` attaches a photo, and `created_at=` says when it was said (from Scroll 2 on). |
 | `add_turn(user_msg, assistant_msg, user_id?, created_at=, user_speaker=, assistant_speaker=)` | Store one exchange of a conversation, optionally with when it was said (an RFC 3339 time with `Z` or `±hh:mm`, or an aware `datetime`) and who said each side. |
 | `add_bulk(content, user_id, category=, timestamp=)` | Backfill a long history in one call. |
 | `update(old_memory_id, new_content, user_id?)` | Replace a fact that changed. The old version stays in its history. |
 | **Read** | |
 | `recall(query, user_id)` | The recent turns, the memories that match and the conversation around the best one, in one call. |
-| `search(query, user_id, limit=10, **opts)` | The memories that match, best first. |
+| `search(query, user_id, limit=10, **opts)` | The memories that match, best first. `limit` caps these; the assistant's own words and image memories, when there are any, follow them (with `filters`, the assistant's words are left out). |
 | `search_full(query, user_id, limit=10, **opts)` | The same search with each part kept apart, `images` and `verify_used` included. |
 | `search_self(query, user_id, ...)` | The assistant's own words, kept apart from what others said. |
 | `history(user_id)` | The recent conversation. |
 | `memory_tools(user_id, preset="S-2", seen=True)` | Adds `memory_recent` and `memory_seen` to the memory tools: the recent conversation, newest first, and the memories held for one of its lines as they stand now. Off by default; `memory_recent` takes each reply's count from `history`, and `memory_seen` asks `seen` once. |
-| `get(user_id, memory_id)` | One memory by id, the text you stored and its metadata. |
+| `get(user_id, memory_id)` | One memory by id and its metadata. |
 | `list_memories` · `iter_memories` · `export_memories` | Every memory in a store: a page at a time, as a stream, or all at once. |
 | `lineage(user_id, memory_id)` | The edits that followed one memory. |
 | `revisions(user_id)` | How many of a store's memories were edited, and which. |
@@ -90,6 +90,9 @@ system = "\n".join([
     "What you remember about this user, most relevant first:",
     *(f"- {m['content']}" for m in ctx["long_term"]["memories"]),
     "",
+    "From the last three days:",
+    *(f"- {m['content']}" for m in (ctx.get("rooms") or {}).get("memories", [])),
+    "",
     "Around the most relevant memory:",
     *ctx["context"]["around_top_memory"],
     "",
@@ -102,7 +105,8 @@ mem.add_turn(user_message, reply, user_id="alice")
 ```
 
 Each row of `around_top_memory` starts with `[before] `, `[match] ` or `[after] `: where it
-sits next to the best memory. Keep every list in the order it arrives.
+sits next to the best memory. Keep every list in the order it arrives. From Scroll 2 on, the rooms' memories, from the last three days, come in
+`rooms`; on a model before it that list is empty.
 
 ## Who said it (speakers)
 
@@ -256,8 +260,8 @@ Built in, none of it configurable off:
   validated before they reach a header.
 - **`Client.from_env()`** reads `WONTOPOS_API_KEY` (or `WOS_API_KEY`) — keep
   keys out of source code.
-- Plain-HTTP base URLs on non-local hosts warn. Two dependencies: `requests`
-  (floor `>=2.32.4`) and `tzdata`.
+- Plain-HTTP base URLs on non-local hosts warn. Three dependencies: `requests`
+  (floor `>=2.32.4`), `urllib3` (floor `>=1.26.20`) and `tzdata`.
 
 ## Errors
 
@@ -315,7 +319,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Thirteen inside 2.2 were not, deliberately and each with its
+releases are additive. Fourteen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

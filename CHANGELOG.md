@@ -6,6 +6,65 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.51 — 2026-11-10
+
+**`add` takes when a memory was said, own words off is sent as its own field, the sleep is 1.0.2, and a round of fixes.**
+
+- `add` takes `created_at`, when the memory was said: `created_at=` in Python (a `datetime`
+  with a time zone, or RFC 3339 with an offset), `opts.createdAt` in TypeScript,
+  `WriteOpts.created_at` with `add_opts` in Rust. It goes as `metadata.created_at` and works
+  from Scroll 2 on; a model before it refuses the write (403). The metadata key is no longer
+  warned about as dropped, and TypeScript exports the options type `AddOptions`.
+- With own words off (`own_words=False`, `ownWords: false`, `.with_own_words(false)`, and the
+  `S-2-live` preset), `open_work` sends `own_words: false`. 2.2.50 sent it as a filter, which
+  the service has taken since 2026-11-09; before that such a look still brought the
+  assistant's lines.
+- A memory tool result shows a date past year 9999, or before year 0, whole (`+010000-01-01`,
+  `08:59`), where it cut both short.
+- Inside a memory, a vertical tab, a form feed and the file, group and record separators
+  (U+000B, U+000C, U+001C to U+001E) are shown in a tool result as a line break is: a line
+  feed and four spaces in their place.
+- In TypeScript a call's deadline is measured on a steady clock, as Python and Rust measure
+  it: a step of the system clock no longer ends a call or lets a retry run past the deadline.
+- In TypeScript a `baseUrl` with `user:password@` sends them as Basic auth and leaves them
+  out of the URL, as Python and Rust do; with the built-in `fetch` every call failed before.
+- In Python `close()` also closes the connections of the model callers the router built from
+  `router.key` and `router.skill_key`; a caller you passed in stays open.
+- The router's prompt writes U+0085, U+2028 and U+2029 inside a skill's input schema as
+  escapes, so a schema cannot break a line of the prompt.
+- On a model without the router's history (the read answers 404 or 501), `ask` no longer
+  sends the write that would fail too, and its `history` reads `skipped` for both where it
+  read `failed`.
+- Rust's `RecallResponse` has `room_memories()`: the memories from the rooms.
+- Python names `urllib3` (`>=1.26.20,<3`) as a dependency, since it imports it. `requests`
+  asks for 1.21.1 or later, so an install that pins `urllib3` below 1.26.20 has to move it.
+- Python's source archive no longer carries the tests.
+- Refused now, where 2.2.50 sent them:
+  - `add` with `user_speaker` or `assistant_speaker` as a metadata key, in all three (in
+    Python the keyword too, which becomes that key): they name a side of a turn, and `add`
+    takes `speaker`. As an option, TypeScript refuses `userSpeaker` and `assistantSpeaker`
+    where it warned and left them out, and Rust refused them already;
+  - `add` with a `created_at` that is not an instant, such as a plain date or a time with no
+    offset, where the metadata key was sent as given.
+- The sleep is 1.0.2. Its rules are the same; it holds them in seven more places:
+  - with two or more people, a speaker named as the being, as `user`, or holding ` · ` is
+    shown in quotes;
+  - what the files and the notes hold is shown to the sleep's models, and to the being, with
+    the sleep's tags opened and every break but a plain line break kept inside its line: a
+    body, a box title, a section heading and a proposal's text;
+  - a file's age reads `1 day ago`, `today` for a day after today, and is left out when the
+    file has no day;
+  - text a core holds before its first heading is kept as the start of `## Me`;
+  - a section is moved only into a file that does not hold one of that name, and a box remade
+    after a person was moved into it that night still holds that person;
+  - a core section named for the being, by its name or the name it speaks under, in any
+    case, is `## Me`;
+  - one of the sleep's tags written in capitals is opened as one in small letters is.
+- The docs say which models an option works from: in TypeScript and Rust, `recall`'s
+  `short_term_limit`, `short_term_budget_tokens`, `max_images` and `include_superseded` and
+  `add_bulk`'s `segments` from Scroll 2 on, and in all three `forget_speaker` from Tablet 2
+  on.
+
 ## 2.2.50 — 2026-11-08
 
 **Your code and your model can see how much of the plan's week is used, the memory tools look the way a conversation needs, and more than 140 fixes.**

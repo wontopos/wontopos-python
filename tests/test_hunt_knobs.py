@@ -20,7 +20,7 @@ SEARCH = json.dumps({"work_id": "w-1", "memories": [], "none": True, "steps_left
 TURN = [(200, {}, OPEN), (200, {}, DEEPER), (200, {}, SEARCH)]
 PATHS = ["/api/v1/memory/work/open", "/api/v1/memory/work/deeper", "/api/v1/memory/work/search"]
 PLAIN = b'{"user_id":"u","question":"what did we plan"}'
-OTHERS = b'"filters":{"source_types":["user_said","ai_thought","inferred","system"]}'
+OTHERS = b'"own_words":false'
 DIVERSITIES = ("none", "mmr", "temporal", "full")
 
 
@@ -60,12 +60,12 @@ class HuntKnobsCases:
                          b'{"user_id":"u","question":"what did we plan","max_images":3,"rooms":"all",'
                          b'"tz_offset_minutes":540}')
 
-    async def test_own_words_off_names_every_source_but_the_assistants_and_later_looks_send_nothing_new(self):
+    async def test_own_words_off_is_sent_as_own_words_false_and_later_looks_send_nothing_new(self):
         plain = await self.turn()
         off = await self.turn(own_words=False)
         self.assertEqual(off[0], plus(OTHERS))
-        self.assertEqual(json.loads(off[0])["filters"],
-                         {"source_types": ["user_said", "ai_thought", "inferred", "system"]})
+        self.assertIs(json.loads(off[0])["own_words"], False)
+        self.assertNotIn("filters", json.loads(off[0]))
         self.assertEqual(off[1:], plain[1:])
 
     async def test_each_diversity_goes_through_and_anything_else_is_refused_before_a_call(self):

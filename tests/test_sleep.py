@@ -670,7 +670,7 @@ class SleepCases:
         self.assertEqual(res["done"]["changed"], True)
         self.assertEqual((res["sleep_id"], res["memories"], res["today"]), ("s-1", 20, "2026-09-15 23:00"))
         self.assertEqual(res["llm_in"], sum(x["in"] for x in res["log"] if "in" in x))
-        self.assertEqual((res["sleep_version"], wontopos.SLEEP_VERSION, wontopos.sleep.SLEEP_VERSION), ("1.0.1",) * 3)
+        self.assertEqual((res["sleep_version"], wontopos.SLEEP_VERSION, wontopos.sleep.SLEEP_VERSION), ("1.0.2",) * 3)
         self.assertGreater(res["llm_out"], 0)
 
     async def test_pages_are_read_to_the_end_and_today_comes_from_the_reading(self):
@@ -1052,7 +1052,7 @@ class SleepCases:
         tokens = sum(r["tokens"] + 12 for r in rows)
         frame = tok(wontopos.sleep._SLEEP_DIGEST) + tok("") + tok("1: (empty)\n2: (empty)\n3: (empty)\n4: (empty)")
         sent, written = -(-(tokens + frame) * 172 // 100), -(-tokens * 7 // 100)
-        basis = {"sleep_version": "1.0.1", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": False,
+        basis = {"sleep_version": "1.0.2", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": False,
                  "margin": 0.15}
         self.assertEqual(est, {"sleep_id": "s-1", "memories": 20, "tokens": tokens, "parts": 1, "readers": 1,
                                "input_tokens": sent, "output_tokens": written,

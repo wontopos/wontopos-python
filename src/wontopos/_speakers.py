@@ -45,7 +45,7 @@ class _SpeakerCalls:
 
     def forget_speaker(self, speaker: Union[str, Sequence[str]], user_id: str, *,
                        preview: bool = False) -> dict:
-        """Delete everything a person said in this store."""
+        """Delete everything a person said in this store (from Tablet 2 on)."""
         body = _forget_speaker_body(speaker, user_id, preview)
         if preview:
             return self._post("/api/v1/memory/forget", body)
@@ -91,7 +91,7 @@ class _AsyncSpeakerCalls:
 
     async def forget_speaker(self, speaker: Union[str, Sequence[str]], user_id: str, *,
                              preview: bool = False) -> dict:
-        """Delete everything a person said in this store."""
+        """Delete everything a person said in this store (from Tablet 2 on)."""
         body = _forget_speaker_body(speaker, user_id, preview)
         if preview:
             return await self._post("/api/v1/memory/forget", body)

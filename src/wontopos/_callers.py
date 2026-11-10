@@ -191,6 +191,12 @@ class _ProviderCaller:
     def __reduce__(self) -> Any:
         raise TypeError("a model caller cannot be pickled: it holds the provider's key. Build one per process.")
 
+    def close(self) -> None:
+        with self._lock:
+            s, self._session = self._session, None
+        if s is not None:
+            s.close()
+
     def _sync_session(self) -> requests.Session:
         with self._lock:
             if self._session is None:

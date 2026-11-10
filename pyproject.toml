@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wontopos"
-version = "2.2.50"
+version = "2.2.51"
 description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."
 readme = "README.md"
 authors = [{ name = "Wontopos" }]
@@ -28,7 +28,8 @@ classifiers = [
 ]
 # >=2.32.4: the TLS context this package builds is used from 2.32.3 on, and 2.32.4
 # carries the fix for CVE-2024-47081. Keep the floor current.
-dependencies = ["requests>=2.32.4", "tzdata>=2024.1"]
+# urllib3 is used directly (its connection classes), so it is named.
+dependencies = ["requests>=2.32.4", "urllib3>=1.26.20,<3", "tzdata>=2024.1"]
 
 [project.optional-dependencies]
 async = ["httpx>=0.27,<1"]

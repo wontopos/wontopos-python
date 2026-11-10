@@ -1895,8 +1895,7 @@ class RoomsWorkCases:
             {"user_id": "u"},
             {"name": "e", "user_id": "u", "query": "q"},
             {"user_id": "u"},
-            {"user_id": "u", "question": "q", "filters": {"source_types": ["user_said", "ai_thought", "inferred", "system"]},
-             "diversity": "full"},
+            {"user_id": "u", "question": "q", "own_words": False, "diversity": "full"},
         ])
 
 
@@ -1939,9 +1938,9 @@ class ReadAsTheOtherClientsTest(unittest.TestCase):
         ]:
             self.assertEqual(wontopos._instant(s), want, s)
 
-    def test_a_day_past_year_9999_is_cut_as_the_typescript_client_cuts_it(self):
+    def test_a_day_past_year_9999_is_shown_whole(self):
         ms = wontopos._instant("9999-12-31T23:00:00Z") + 9 * 3_600_000
-        self.assertEqual(wontopos._day_minute(ms), ("+010000-01", "01T08"))
+        self.assertEqual(wontopos._day_minute(ms), ("+010000-01-01", "08:00"))
         self.assertEqual(wontopos._day_minute(wontopos._instant("0000-03-01T00:00:00Z")), ("0000-03-01", "00:00"))
 
     def test_a_number_is_written_as_javascript_writes_it(self):

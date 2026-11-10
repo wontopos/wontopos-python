@@ -414,7 +414,6 @@ def _close_work_body(store_id: str, work_id: Any, answer_id: Any) -> dict:
 
 
 _DIVERSITIES = ("none", "mmr", "temporal", "full")
-_NOT_ASSISTANT_SOURCES = ("user_said", "ai_thought", "inferred", "system")
 
 
 def _tools_diversity(value: Any) -> Optional[str]:
@@ -434,7 +433,7 @@ def _open_work_body(store_id: str, question: Any, rooms: Any, tz: Optional[float
         body["max_images"] = max_images
     body = _look(body, rooms, tz, client_tz)
     if own_words is not None and not _check_flag(own_words, "own_words"):
-        body["filters"] = {"source_types": list(_NOT_ASSISTANT_SOURCES)}
+        body["own_words"] = False
     diversity = _tools_diversity(diversity)
     if diversity is not None:
         body["diversity"] = diversity
@@ -475,7 +474,8 @@ def _names_a_store(key: Any) -> bool:
     return isinstance(key, str) and re.sub(f"[{_JS_SPACE_CLASS}_.\\-]", "", key.lower()) in _NOT_METADATA
 
 
-_KEPT_METADATA_KEYS = frozenset({"speaker", "event_date", "category", "conversation_id"})
+_KEPT_METADATA_KEYS = frozenset({"speaker", "event_date", "category", "conversation_id", "created_at"})
+_TURN_SIDES = ("user_speaker", "assistant_speaker")
 _warned_metadata_keys: set = set()
 
 
@@ -490,7 +490,7 @@ def _warn_on_unknown_metadata(md: dict) -> None:
         )
 
 
-def _metadata(metadata: Optional[dict], extra: dict) -> dict:
+def _metadata(metadata: Optional[dict], extra: dict, created_at: Any = None) -> dict:
     bad = sorted(k for k in {**(metadata or {}), **extra} if _names_a_store(k))
     extra = {k: v for k, v in extra.items() if v is not None}
     md = {**metadata, **extra} if metadata else extra
@@ -499,6 +499,13 @@ def _metadata(metadata: Optional[dict], extra: dict) -> dict:
             f"{bad[0]!r} is not a metadata field: pass the store as user_id= and an "
             "idempotency key as idempotency_key=. Nothing was sent."
         )
+    for side in _TURN_SIDES:
+        if md.get(side) is not None:
+            raise ValueError(f"{side} is for add_turn: it names a side of a turn. On add, name who said it with speaker=.")
+    if created_at is not None:
+        md["created_at"] = created_at
+    if md.get("created_at") is not None:
+        md["created_at"] = _turn_time(md["created_at"], "created_at")
     if isinstance(md.get("speaker"), str):
         md["speaker"] = _turn_speaker(md["speaker"], "speaker")
     _warn_on_unknown_metadata(md)

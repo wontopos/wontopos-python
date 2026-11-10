@@ -78,9 +78,9 @@ def _revisions_body(client: Any, user_id: Optional[str], include: Optional[str],
 
 def _add_body(client: Any, content: str, user_id: Optional[str], metadata: Optional[dict], extra: dict,
               image: Optional[dict], tz: Optional[float], work_id: Optional[str], window: Optional[bool],
-              window_role: Optional[str]) -> dict:
+              window_role: Optional[str], created_at: Any = None) -> dict:
     sid = client._uid(user_id)
-    md = _metadata(metadata, extra)
+    md = _metadata(metadata, extra, created_at)
     body = _window_line(_write_extras({"user_id": sid, "content": content, "metadata": md},
                                       tz, client._tz, work_id), window, window_role)
     if image is not None:
@@ -102,9 +102,11 @@ class _MemoryCalls:
             image: Optional[dict] = None, tz: Optional[float] = None,
             work_id: Optional[str] = None,
             window: Optional[bool] = None, window_role: Optional[str] = None,
+            created_at: Optional[Union[str, datetime]] = None,
             **extra: Any) -> dict:
-        """Store one memory. Extra keyword arguments become metadata."""
-        body = _add_body(self, content, user_id, metadata, extra, image, tz, work_id, window, window_role)
+        """Store one memory. Extra keyword arguments become metadata.
+        ``created_at``: when it was said, a datetime with a time zone or RFC 3339 with an offset (from Scroll 2 on)."""
+        body = _add_body(self, content, user_id, metadata, extra, image, tz, work_id, window, window_role, created_at)
         return self._write("/api/v1/memory/store", body, model=model, idempotency_key=idempotency_key)
 
     store = add
@@ -344,9 +346,11 @@ class _AsyncMemoryCalls:
             image: Optional[dict] = None, tz: Optional[float] = None,
             work_id: Optional[str] = None,
             window: Optional[bool] = None, window_role: Optional[str] = None,
+            created_at: Optional[Union[str, datetime]] = None,
             **extra: Any) -> dict:
-        """Store one memory. Extra keyword arguments become metadata."""
-        body = _add_body(self, content, user_id, metadata, extra, image, tz, work_id, window, window_role)
+        """Store one memory. Extra keyword arguments become metadata.
+        ``created_at``: when it was said, a datetime with a time zone or RFC 3339 with an offset (from Scroll 2 on)."""
+        body = _add_body(self, content, user_id, metadata, extra, image, tz, work_id, window, window_role, created_at)
         return await self._write("/api/v1/memory/store", body, model=model, idempotency_key=idempotency_key)
 
     store = add

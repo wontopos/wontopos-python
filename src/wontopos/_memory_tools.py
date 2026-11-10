@@ -139,7 +139,7 @@ def _text(v: Any) -> str:
     return "" if v is None else _js_str(v)
 
 
-_STORED_BREAK = re.compile("\r\n|[\r\n\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
+_STORED_BREAK = re.compile("\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
 _NAME_BREAK = re.compile("\r\n|[\x00-\x1f\x7f-\x9f\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]")
 _LABELS = ("you", "user", "note")
 _IGNORABLE = re.compile("[" + "".join(f"{chr(a)}-{chr(b)}" for a, b in (
@@ -239,8 +239,7 @@ def _day_minute(ms: int) -> tuple:
     y, m, d = _civil_from_days(ms // _DAY_MS)
     year = f"{y:04d}" if 0 <= y <= 9999 else f"{'-' if y < 0 else '+'}{abs(y):06d}"
     minute = ms % _DAY_MS // 60_000
-    iso = f"{year}-{m:02d}-{d:02d}T{minute // 60:02d}:{minute % 60:02d}"
-    return iso[:10], iso[11:16]
+    return f"{year}-{m:02d}-{d:02d}", f"{minute // 60:02d}:{minute % 60:02d}"
 
 
 def _utc_label(minutes: int) -> str:
