@@ -742,8 +742,10 @@ def _net_error(where: str, reason: str) -> "APIConnectionError":
 class _Call:
 
     def __init__(self, method: str, path: str, retries: int, deadline: Optional[float], *,
-                 removes: Optional[bool] = None, reads: bool = False, keyed: bool = False):
+                 removes: Optional[bool] = None, reads: bool = False, keyed: bool = False,
+                 model: Optional[str] = None):
         self.method = method.upper()
+        self.model = model
         self.where = f"{method} {path.split('?', 1)[0]}"
         self.attempts = retries + 1
         self.attempt = 0
@@ -850,15 +852,20 @@ def _plan_call(client: Any, method: str, path: str, json_body: Optional[dict], m
         headers.update(idem)
     data = _encode_json(json_body)
     call = _Call(method, path, client._retries, client._deadline, removes=removes, reads=reads,
-                 keyed=idem is not None)
+                 keyed=idem is not None, model=eff_model)
     return eff_model, headers or None, data, f"{client._base}{path}", call
 
 
-def _answered(client: Any, call: _Call, model: Optional[str], got: tuple, start: float) -> bool:
-    status, rheaders, _ = got
+def _read_head(client: Any, call: _Call, status: int, headers: Any) -> None:
+    """Read as the headers arrive, before the body, as TypeScript and Rust do."""
+    _read_billing(client, status, headers)
     if not 300 <= status < 400:
-        client._rate_limit = _parse_rate_limit(rheaders) or client._rate_limit
-        _warn_if_retiring(model, rheaders)
+        client._rate_limit = _parse_rate_limit(headers) or client._rate_limit
+        _warn_if_retiring(call.model, headers)
+
+
+def _answered(client: Any, call: _Call, got: tuple, start: float) -> bool:
+    status = got[0]
     _logger.debug("%s -> %d in %.0fms (attempt %d/%d)", call.where, status,
                   (_time.monotonic() - start) * 1000, call.attempt + 1, call.attempts)
     return 200 <= status < 300

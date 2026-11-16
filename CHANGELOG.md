@@ -6,6 +6,20 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.52 — 2026-11-16
+
+**Python reads a response's headers as they arrive, and an imported code skill waits for a person's yes.**
+
+- In Python, `rate_limit` and the warning that a model retires are read as a response's
+  headers arrive, as TypeScript and Rust read them. A body that broke off left `rate_limit`
+  as it was and the warning unsaid.
+- `import_skills` (`importSkills` in TypeScript) brings in a code skill with `confirm` on,
+  whatever the text says. `ask` then answers `needs_confirmation` instead of running it, and
+  your app runs it with `run_skill` (`runSkill`) once the person agrees. To have `ask` run it,
+  remove it and add it again with `add_skill` (`addSkill`).
+- `search`'s description and the READMEs point to `recall` for an LLM's context. From Scroll 2
+  on, `recall` also brings the last three days by part of the day, which `search` does not.
+
 ## 2.2.51 — 2026-11-10
 
 **`add` takes when a memory was said, own words off is sent as its own field, the sleep is 1.0.2, and a round of fixes.**

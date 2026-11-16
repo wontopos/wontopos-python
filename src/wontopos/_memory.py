@@ -150,7 +150,7 @@ class _MemoryCalls:
         verify: Optional[int] = None, max_images: Optional[int] = None,
         model: Optional[str] = None, **opts: Any
     ) -> list[dict]:
-        """Search a store's memories."""
+        """Search a store's memories; for an LLM's context use `recall`, which also brings the recent turns and, from Scroll 2 on, the last three days."""
         body = _default_tz(_search_body(self._uid(user_id), query, limit, opts, verify, max_images), self._tz)
         r = self._post("/api/v1/memory/search", body, model=model)
         return _merge_results(r, bool(body.get("filters")))
@@ -185,7 +185,7 @@ class _MemoryCalls:
         max_images: Optional[int] = None, filters: Optional[dict] = None,
         speaker: Optional[str] = None, include_superseded: Optional[bool] = None,
     ) -> dict:
-        """One-call context for an LLM: recent turns, long-term memories and the context around them."""
+        """One-call context for an LLM: recent turns, long-term memories and the context around them, and from Scroll 2 on the last three days by part of the day."""
         body = _recall_body(self._uid(user_id), query, form, tz, limit, context_limit, rooms, self._tz,
                             room=room, room_limit=room_limit, room_expand_tokens=room_expand_tokens,
                             long_term=long_term, long_term_cutoff=long_term_cutoff,
@@ -394,7 +394,7 @@ class _AsyncMemoryCalls:
         verify: Optional[int] = None, max_images: Optional[int] = None,
         model: Optional[str] = None, **opts: Any
     ) -> list[dict]:
-        """Search a store's memories."""
+        """Search a store's memories; for an LLM's context use `recall`, which also brings the recent turns and, from Scroll 2 on, the last three days."""
         body = _default_tz(_search_body(self._uid(user_id), query, limit, opts, verify, max_images), self._tz)
         return _merge_results(await self._post("/api/v1/memory/search", body, model=model), bool(body.get("filters")))
 
@@ -428,7 +428,7 @@ class _AsyncMemoryCalls:
         max_images: Optional[int] = None, filters: Optional[dict] = None,
         speaker: Optional[str] = None, include_superseded: Optional[bool] = None,
     ) -> dict:
-        """One-call context for an LLM: recent turns, long-term memories and the context around them."""
+        """One-call context for an LLM: recent turns, long-term memories and the context around them, and from Scroll 2 on the last three days by part of the day."""
         body = _recall_body(self._uid(user_id), query, form, tz, limit, context_limit, rooms, self._tz,
                             room=room, room_limit=room_limit, room_expand_tokens=room_expand_tokens,
                             long_term=long_term, long_term_cutoff=long_term_cutoff,

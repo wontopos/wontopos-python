@@ -822,7 +822,8 @@ class RouterCases:
         self.assertEqual((parsed["wontopos_skills"], parsed["store"]), (1, "a"))
         self.assertEqual([s["name"] for s in parsed["skills"]], ["add_event", "lookup"])
         self.assertEqual(await done(mem.import_skills(text, "d")), ["add_event", "lookup"])
-        self.assertEqual(await done(mem.list_skills("d")), await done(mem.list_skills("a")))
+        self.assertEqual(await done(mem.list_skills("d")), [{**EVENT, "confirm": True}, WEB],
+                         "a code skill comes in with confirm on; an llm skill as it was")
         self.assertEqual(await done(mem.import_skills(parsed, "f")), ["add_event", "lookup"],
                          "the parsed dict works too")
         await self.raises(ValueError, 'already has a skill named "add_event"; nothing was imported',
@@ -836,6 +837,10 @@ class RouterCases:
         await self.raises(ValueError, "in the skills twice", lambda: mem.import_skills(twice, "g"))
         bare = self.client(engine, {})
         await self.raises(ValueError, r"router\.handlers\.add_event", lambda: bare.import_skills(text, "h"))
+        off = json.dumps({"wontopos_skills": 1, "skills": [{**EVENT, "confirm": False}, {**WEB, "confirm": False}]})
+        self.assertEqual(await done(mem.import_skills(off, "i")), ["add_event", "lookup"])
+        self.assertEqual([s.get("confirm") for s in await done(mem.list_skills("i"))], [True, False],
+                         "an import cannot bind your function to a skill that runs without asking")
 
     async def test_a_skill_definition_is_checked_when_added(self):
         engine = self.engine()

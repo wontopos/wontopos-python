@@ -37,8 +37,8 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 | `add_bulk(content, user_id, category=, timestamp=)` | Backfill a long history in one call. |
 | `update(old_memory_id, new_content, user_id?)` | Replace a fact that changed. The old version stays in its history. |
 | **Read** | |
-| `recall(query, user_id)` | The recent turns, the memories that match and the conversation around the best one, in one call. |
-| `search(query, user_id, limit=10, **opts)` | The memories that match, best first. `limit` caps these; the assistant's own words and image memories, when there are any, follow them (with `filters`, the assistant's words are left out). |
+| `recall(query, user_id)` | The recent turns, the memories that match and the conversation around the best one, in one call. From Scroll 2 on, the last three days by part of the day too. |
+| `search(query, user_id, limit=10, **opts)` | The memories that match, best first. `limit` caps these; the assistant's own words and image memories, when there are any, follow them (with `filters`, the assistant's words are left out). For an LLM's context, use `recall`. |
 | `search_full(query, user_id, limit=10, **opts)` | The same search with each part kept apart, `images` and `verify_used` included. |
 | `search_self(query, user_id, ...)` | The assistant's own words, kept apart from what others said. |
 | `history(user_id)` | The recent conversation. |
@@ -319,7 +319,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Fourteen inside 2.2 were not, deliberately and each with its
+releases are additive. Fifteen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

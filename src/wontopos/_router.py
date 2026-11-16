@@ -1085,6 +1085,9 @@ def _skills_import(client: Any, data: Any, user_id: Optional[str]) -> list:
             defs.append(_check_skill(s, st))
         except ValueError as e:
             raise ValueError(f"skills[{i}]: {e} Nothing was imported.") from None
+    for d in defs:
+        if d["kind"] == "code":
+            d["confirm"] = True
     with st.lock:
         names: set = set()
         for d in defs:
@@ -1589,7 +1592,7 @@ class _RouterCalls:
         return _skills_export(self, user_id)
 
     def import_skills(self, data: Union[str, dict], user_id: Optional[str] = None) -> list[str]:
-        """Add the skills of an :meth:`export_skills` text to a store, all or none."""
+        """Add the skills of an :meth:`export_skills` text to a store, all or none. A code skill comes in with confirm on."""
         return _skills_import(self, data, user_id)
 
     def import_skill_md(self, user_id: Optional[str], text: str, *, name: Optional[str] = None,
@@ -1656,7 +1659,7 @@ class _AsyncRouterCalls:
         return _skills_export(self, user_id)
 
     async def import_skills(self, data: Union[str, dict], user_id: Optional[str] = None) -> list[str]:
-        """Add the skills of an :meth:`export_skills` text to a store, all or none."""
+        """Add the skills of an :meth:`export_skills` text to a store, all or none. A code skill comes in with confirm on."""
         return _skills_import(self, data, user_id)
 
     async def import_skill_md(self, user_id: Optional[str], text: str, *, name: Optional[str] = None,

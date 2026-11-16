@@ -33,7 +33,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.51"
+__version__ = "2.2.52"
 
 __all__ = [
     "Client", "AsyncClient", "WME", "MemoryTools", "AsyncMemoryTools",
@@ -1053,7 +1053,7 @@ from ._http import (  # noqa: E402
     _STORE_TIMEOUT, _TLSAdapter, _TLS_CONTEXTS, _WATCHED_POOLS, _Watchdog, _answered, _async_scheme_host,
     _async_tls_context, _attempt_local, _backoff, _check_base_url, _drop_pools_after_fork, _env_key, _json_answer,
     _mask_userinfo, _never_sent, _new_idempotency_key, _off_the_wire, _parse_error, _parse_retry_after, _plan_call,
-    _read_billing, _require_url, _retry_wait, _sessions, _shown_base, _timed_out, _tls_context, _transport_reason,
+    _read_head, _require_url, _retry_wait, _sessions, _shown_base, _timed_out, _tls_context, _transport_reason,
     _url_login, _warn_if_plain_http, _warned_plain_http, _warned_retirements,
 )
 from ._memory_tools import (  # noqa: E402
@@ -1326,7 +1326,7 @@ class Client(_MemoryCalls, _ImageCalls, _SpeakerCalls, _WorkCalls, _MemoryToolsC
               params: Optional[dict] = None, model: Optional[str] = None,
               idempotency_key: Optional[str] = None, removes: Optional[bool] = None,
               reads: bool = False) -> tuple:
-        eff_model, headers, data, url, call = _plan_call(self, method, path, json_body, model,
+        _, headers, data, url, call = _plan_call(self, method, path, json_body, model,
                                                          idempotency_key, removes, reads)
         for attempt in range(call.attempts):
             call.attempt = attempt
@@ -1336,7 +1336,7 @@ class Client(_MemoryCalls, _ImageCalls, _SpeakerCalls, _WorkCalls, _MemoryToolsC
             if isinstance(got, _Failure):
                 _time.sleep(call.after_failure(got, clock))
                 continue
-            if _answered(self, call, eff_model, got, start):
+            if _answered(self, call, got, start):
                 return got
             _time.sleep(call.after_status(*got))
         raise RuntimeError("retries exhausted")
@@ -1360,7 +1360,7 @@ class Client(_MemoryCalls, _ImageCalls, _SpeakerCalls, _WorkCalls, _MemoryToolsC
                 failure = _Failure(_transport_reason(e), never_sent=never, timed_out=timed,
                                    dropped=broke and not timed)
             if r is not None:
-                _read_billing(self, r.status_code, r.headers)
+                _read_head(self, call, r.status_code, r.headers)
             if r is not None and not 300 <= r.status_code < 400:
                 body_clock = clock
                 if call.retries_regardless(r.status_code, r.headers):
@@ -1617,7 +1617,7 @@ class AsyncClient(
                     idempotency_key: Optional[str] = None, removes: Optional[bool] = None,
                     reads: bool = False) -> tuple:
         http = self._http_for_this_loop()
-        eff_model, headers, data, url, call = _plan_call(self, method, path, json_body, model,
+        _, headers, data, url, call = _plan_call(self, method, path, json_body, model,
                                                          idempotency_key, removes, reads)
         for attempt in range(call.attempts):
             call.attempt = attempt
@@ -1627,7 +1627,7 @@ class AsyncClient(
             if isinstance(got, _Failure):
                 await _async_sleep(call.after_failure(got, clock))
                 continue
-            if _answered(self, call, eff_model, got, start):
+            if _answered(self, call, got, start):
                 return got
             await _async_sleep(call.after_status(*got))
         raise RuntimeError("retries exhausted")
@@ -1676,7 +1676,7 @@ class AsyncClient(
             ) as r:
                 status, rheaders = r.status_code, r.headers
                 head[:] = [status, rheaders]
-                _read_billing(self, status, rheaders)
+                _read_head(self, call, status, rheaders)
                 if 300 <= status < 400:
                     return status, rheaders, b""
                 try:
