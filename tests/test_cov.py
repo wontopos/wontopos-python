@@ -436,7 +436,7 @@ class ClientCovTest(unittest.TestCase):
         mem = self.offline()
         with self.assertRaises(ValueError) as cm:
             mem.recall("q", "u", context_limit="5")
-        self.assertEqual(str(cm.exception), "context_limit must be an int, got str")
+        self.assertEqual(str(cm.exception), 'context_limit must be an integer between 0 and 20, got "5".')
         with self.assertRaises(ValueError) as cm:
             mem.write_sleep_files("s-1", [1], "u")
         self.assertEqual(str(cm.exception), "writes[0] must be a dict.")

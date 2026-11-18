@@ -838,7 +838,7 @@ class RoomsWorkCases:
             with self.subTest(default_speakers=bad):
                 with self.assertRaisesRegex(ValueError, "default_speakers must be a dict"):
                     await done(mem.set_settings("u", default_speakers=bad))
-        with self.assertRaisesRegex(ValueError, "takes \"user\" and \"assistant\" only, got 'owner'"):
+        with self.assertRaisesRegex(ValueError, 'takes "user" and "assistant" only, got "owner"'):
             await done(mem.set_settings("u", default_speakers={"user": "Dana", "owner": "Kai"}))
         for bad in ("", "  ", 5):
             with self.subTest(name=bad):
@@ -887,12 +887,12 @@ class RoomsWorkCases:
 
     async def test_relabel_checks_its_arguments_before_sending(self):
         srv, mem = self.new()
-        with self.assertRaisesRegex(ValueError, "from_speaker is required"):
+        with self.assertRaisesRegex(ValueError, "from_speaker must be a speaker's name"):
             await done(mem.relabel_speaker(" ", "Kai", "u"))
-        with self.assertRaisesRegex(ValueError, "to_speaker is required"):
+        with self.assertRaisesRegex(ValueError, "to_speaker must be a speaker's name"):
             await done(mem.relabel_speaker("Dana", None, "u"))
         for ids, got in (([], "0"), (["m"] * 1001, "1001")):
-            with self.assertRaisesRegex(ValueError, f"memory_ids must hold 1 to 1000 memory ids, got {got}"):
+            with self.assertRaisesRegex(ValueError, f"memory_ids must be a list of 1 to 1000 memory ids, got {got} ids"):
                 await done(mem.relabel_speaker("Dana", "Kai", "u", memory_ids=ids))
         with self.assertRaisesRegex(ValueError, "memory_ids must be a list of memory ids, got str"):
             await done(mem.relabel_speaker("Dana", "Kai", "u", memory_ids="m-1"))
@@ -930,11 +930,11 @@ class RoomsWorkCases:
 
     async def test_forget_speaker_refuses_before_sending(self):
         srv, mem = self.new()
-        with self.assertRaisesRegex(ValueError, "an empty list"):
+        with self.assertRaisesRegex(ValueError, "a list of at least one name"):
             await done(mem.forget_speaker([], "u"))
-        with self.assertRaisesRegex(ValueError, r"speaker\[1\] is required"):
+        with self.assertRaisesRegex(ValueError, r"speaker\[1\] must be a speaker's name"):
             await done(mem.forget_speaker(["Dana", " "], "u"))
-        with self.assertRaisesRegex(ValueError, "speaker is required"):
+        with self.assertRaisesRegex(ValueError, "speaker must be a speaker's name"):
             await done(mem.forget_speaker(None, "u"))
         for bad in (None, 1, "yes"):
             with self.subTest(preview=bad):
@@ -1019,7 +1019,7 @@ class RoomsWorkCases:
         self.assertEqual(settings, {"user_id": "u", "time_zone": "Asia/Seoul", "default_speakers": {"user": "Dana"}})
         with self.assertRaisesRegex(ValueError, "to_speaker contains a line break or a control character"):
             await done(mem.relabel_speaker("Dana", "Kai\x85", "u"))
-        with self.assertRaisesRegex(ValueError, r"default_speakers\['user'\] contains a line break or a control character"):
+        with self.assertRaisesRegex(ValueError, r'default_speakers\["user"\] contains a line break or a control character'):
             await done(mem.set_settings("u", default_speakers={"user": "\x1cDana"}))
         self.assertEqual(stored["image"]["data"], "QUJD\x85")
         self.assertEqual((spoken["speaker"], edits["memory_id"]), ("Da\x07na", "m\x07-1"))
@@ -1037,13 +1037,13 @@ class RoomsWorkCases:
             (dict(segments="text"), "segments must be a list of pieces, got str"),
             (dict(segments=["text"]), r"segments\[0\] must be a dict"),
             (dict(segments=[{"content": "y"}, {"content": "z", "origin": "x"}]),
-             r"segments\[1\] has 'origin', which a piece does not take"),
-            (dict(segments=[{"content": "y", "createdAt": "2026-05-02T09:00:00Z"}]), r"segments\[0\] has 'createdAt'"),
+             r'segments\[1\] has "origin", which a piece does not take'),
+            (dict(segments=[{"content": "y", "createdAt": "2026-05-02T09:00:00Z"}]), r'segments\[0\] has "createdAt"'),
             (dict(segments=[{"speaker": "Dana"}]), r'segments\[0\]\["content"\] is required'),
             (dict(segments=[{"content": "  "}]), r'segments\[0\]\["content"\] is required'),
             (dict(segments=[{"content": "y", "created_at": ""}]), r'segments\[0\]\["created_at"\] is required'),
-            (dict(segments=[{"content": "y", "speaker": 5}]), r'segments\[0\]\["speaker"\] is required'),
-            (dict(content="x", speaker=" "), "speaker is required"),
+            (dict(segments=[{"content": "y", "speaker": 5}]), r'segments\[0\]\["speaker"\] must be a speaker\'s name'),
+            (dict(content="x", speaker=" "), "speaker must be a speaker's name"),
         )
         for kwargs, message in refusals:
             with self.subTest(message=message):
@@ -1082,8 +1082,8 @@ class RoomsWorkCases:
                 "\u0662026-05-02T09:00:00Z",
             )),
             (dict(created_at=datetime(2026, 5, 2, 9, 0)), "created_at must carry a time zone"),
-            (dict(user_speaker=" "), "user_speaker is required"),
-            (dict(assistant_speaker=5), "assistant_speaker is required"),
+            (dict(user_speaker=" "), "user_speaker must be a speaker's name"),
+            (dict(assistant_speaker=5), "assistant_speaker must be a speaker's name"),
             (dict(user_speaker="\u4e00" *86), "user_speaker is at most 256 bytes"),
         )
         for kwargs, message in refusals:
@@ -1491,8 +1491,8 @@ class RoomsWorkCases:
 
     async def test_memory_tools_assistant_is_checked_before_anything_is_sent(self):
         srv, mem = self.new([], model="scroll-2")
-        for bad, msg in [("", "assistant is required"), ("  \t", "assistant is required"),
-                         (7, "assistant is required"), ("a" * 257, "at most 256 bytes"),
+        for bad, msg in [("", "assistant must be a speaker's name"), ("  \t", "assistant must be a speaker's name"),
+                         (7, "assistant must be a speaker's name"), ("a" * 257, "at most 256 bytes"),
                          ("é" * 129, "at most 256 bytes"), ("Ana\nKai", "control character"),
                          ("A\x7fna", "control character"), ("A\x85na", "control character"),
                          ("A\N{LINE SEPARATOR}na", "assistant contains a line break or a control character"),
@@ -1832,13 +1832,13 @@ class RoomsWorkCases:
         self.assertEqual((turn["created_at"], turn["user_speaker"]), ("2026-05-02T09:00:00Z", "Dana"))
         for call, message in (
             (lambda: mem.set_settings("u", default_speakers={"assistant": "Kai\u0085"}),
-             r"default_speakers\['assistant'\] contains a line break or a control character"),
+             r'default_speakers\["assistant"\] contains a line break or a control character'),
             (lambda: mem.relabel_speaker("Dana", "Kai\u0085", "u"), "to_speaker contains a line break or a control character"),
             (lambda: mem.set_settings("u", default_speakers={"user": "﻿"}), "must be a speaker's name"),
-            (lambda: mem.relabel_speaker("﻿", "Kai", "u"), "from_speaker is required"),
-            (lambda: mem.relabel_speaker("Dana", " ﻿", "u"), "to_speaker is required"),
-            (lambda: mem.forget_speaker("﻿", "u"), "speaker is required"),
-            (lambda: mem.forget_speaker(["Dana", "﻿"], "u"), r"speaker\[1\] is required"),
+            (lambda: mem.relabel_speaker("﻿", "Kai", "u"), "from_speaker must be a speaker's name"),
+            (lambda: mem.relabel_speaker("Dana", " ﻿", "u"), "to_speaker must be a speaker's name"),
+            (lambda: mem.forget_speaker("﻿", "u"), "speaker must be a speaker's name"),
+            (lambda: mem.forget_speaker(["Dana", "﻿"], "u"), r"speaker\[1\] must be a speaker's name"),
             (lambda: mem.by_speaker("﻿", "u"), "speaker is required"),
             (lambda: mem.add_turn("q", "a", "u", created_at="2026-05-02T09:00:00Z\u0085"), "created_at must be"),
         ):

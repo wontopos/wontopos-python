@@ -33,7 +33,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.52"
+__version__ = "2.2.53"
 
 __all__ = [
     "Client", "AsyncClient", "WME", "MemoryTools", "AsyncMemoryTools",
@@ -1044,7 +1044,7 @@ from ._checks import (  # noqa: E402
     _form_body, _id_body, _incomplete, _list_size, _look, _mask_key, _memory_from_get, _memory_page, _merge_results,
     _metadata, _named_store, _normalize_image, _one_room, _open_work_body, _page_fields, _recall_body, _recall_shape,
     _relabel_body, _require_memory_id, _required, _retrievals_body, _search_body, _settings_body, _sleep_notes_body,
-    _sleep_open_body, _sleep_slot, _sleep_verify_body, _sleep_writes, _supersede_body, _turn_body,
+    _shown, _sleep_open_body, _speaker_arg, _sleep_slot, _sleep_verify_body, _sleep_writes, _supersede_body, _turn_body,
     _turn_speaker, _tz_minutes, _warn_if_store_id_collapses, _warned_filter_keys, _warned_metadata_keys,
     _warned_store_ids, _window_line, _work_around_body, _work_result, _write_extras,
 )

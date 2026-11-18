@@ -1,0 +1,322 @@
+{
+ "what": "Arguments each client refuses before anything is sent, and what it says. The message is the same in all three, in each language's names (user_id / userId), except where a row says how the idioms differ; rust_says is Rust's words where they differ from Python's.",
+ "cases": [
+  {
+   "case": "add: blank store",
+   "python": "mem.add('x', '  ')",
+   "typescript": "mem.add('x', '  ')",
+   "python_says": "user_id must be a non-blank string; got \"  \". Omit it to use the client's default store, or pass a real store id \u2014 anything else would silently write into the default store.",
+   "typescript_says": "userId must be a non-blank string; got \"  \". Omit it to use the client's default store, or pass a real store id \u2014 anything else would silently write into the default store."
+  },
+  {
+   "case": "add: store not text",
+   "python": "mem.add('x', 5)",
+   "typescript": "mem.add('x', 5)",
+   "python_says": "user_id must be a non-blank string; got 5. Omit it to use the client's default store, or pass a real store id \u2014 anything else would silently write into the default store.",
+   "typescript_says": "userId must be a non-blank string; got 5. Omit it to use the client's default store, or pass a real store id \u2014 anything else would silently write into the default store."
+  },
+  {
+   "case": "add: created_at a plain date",
+   "python": "mem.add('x', 'u', created_at='2024-03-01')",
+   "typescript": "mem.add('x', 'u', undefined, {createdAt: '2024-03-01'})",
+   "python_says": "created_at must be a datetime with a time zone or an RFC 3339 time with Z or a \u00b1hh:mm offset, such as 2026-05-02T09:00:00Z (a date alone, a time with no offset, and a space or a small t in place of the T are refused), got \"2024-03-01\".",
+   "typescript_says": "createdAt must be a Date or an RFC 3339 time with Z or a \u00b1hh:mm offset, such as 2026-05-02T09:00:00Z (a date alone, a time with no offset, and a space or a small t in place of the T are refused), got \"2024-03-01\".",
+   "differs_by_idiom": "a datetime in Python, a Date in TypeScript",
+   "rust_says": "created_at must be an RFC 3339 time with Z or a \u00b1hh:mm offset, such as 2026-05-02T09:00:00Z (a date alone, a time with no offset, and a space or a small t in place of the T are refused), got \"2024-03-01\"."
+  },
+  {
+   "case": "add: user_speaker",
+   "python": "mem.add('x', 'u', metadata={'user_speaker': 'A'})",
+   "typescript": "mem.add('x', 'u', {user_speaker: 'A'})",
+   "python_says": "user_speaker is for add_turn: it names a side of a turn. On add, name who said it with speaker=.",
+   "typescript_says": "user_speaker is for addTurn: it names a side of a turn. On add, name who said it in metadata.speaker.",
+   "differs_by_idiom": "speaker= in Python, metadata.speaker in TypeScript",
+   "rust_says": "user_speaker is for add_turn_opts: it names a side of a turn. On add, name who said it in metadata.speaker."
+  },
+  {
+   "case": "add: unknown metadata type",
+   "python": "mem.add('x', 'u', metadata='a')",
+   "typescript": "mem.add('x', 'u', 'a')",
+   "python_says": "metadata must be a dict, got str. Nothing was sent.",
+   "typescript_says": "metadata must be an object, got string. Nothing was sent.",
+   "differs_by_idiom": "a dict in Python, an object in TypeScript",
+   "rust_says": "metadata must be an object, got string. Nothing was sent."
+  },
+  {
+   "case": "add_turn: both empty",
+   "python": "mem.add_turn('', '', 'u')",
+   "typescript": "mem.addTurn('', '', 'u')",
+   "python_says": "user_msg and assistant_msg are both blank: there is no turn to store.",
+   "typescript_says": "userMsg and assistantMsg are both blank: there is no turn to store."
+  },
+  {
+   "case": "update: no id",
+   "python": "mem.update('', 'x', 'u')",
+   "typescript": "mem.update('', 'x', 'u')",
+   "python_says": "old_memory_id is required.",
+   "typescript_says": "oldMemoryId is required."
+  },
+  {
+   "case": "update: empty content",
+   "python": "mem.update('m1', '', 'u')",
+   "typescript": "mem.update('m1', '', 'u')",
+   "python_says": "new_content is required.",
+   "typescript_says": "newContent is required."
+  },
+  {
+   "case": "search: limit 0",
+   "python": "mem.search('q', 'u', 0)",
+   "typescript": "mem.search('q', 'u', 0)",
+   "python_says": "limit must be an integer between 5 and 20, got 0. Out of range is refused rather than adjusted, so a short answer always means the store was short.",
+   "typescript_says": "limit must be an integer between 5 and 20, got 0. Out of range is refused rather than adjusted, so a short answer always means the store was short."
+  },
+  {
+   "case": "search: limit 1000",
+   "python": "mem.search('q', 'u', 1000)",
+   "typescript": "mem.search('q', 'u', 1000)",
+   "python_says": "limit must be an integer between 5 and 20, got 1000. Out of range is refused rather than adjusted, so a short answer always means the store was short.",
+   "typescript_says": "limit must be an integer between 5 and 20, got 1000. Out of range is refused rather than adjusted, so a short answer always means the store was short."
+  },
+  {
+   "case": "search: limit 2.5",
+   "python": "mem.search('q', 'u', 2.5)",
+   "typescript": "mem.search('q', 'u', 2.5)",
+   "python_says": "limit must be an integer between 5 and 20, got 2.5. Out of range is refused rather than adjusted, so a short answer always means the store was short.",
+   "typescript_says": "limit must be an integer between 5 and 20, got 2.5. Out of range is refused rather than adjusted, so a short answer always means the store was short."
+  },
+  {
+   "case": "search: limit text",
+   "python": "mem.search('q', 'u', '5')",
+   "typescript": "mem.search('q', 'u', '5')",
+   "python_says": "limit must be an integer between 5 and 20, got \"5\". Out of range is refused rather than adjusted, so a short answer always means the store was short.",
+   "typescript_says": "limit must be an integer between 5 and 20, got \"5\". Out of range is refused rather than adjusted, so a short answer always means the store was short."
+  },
+  {
+   "case": "recall: limit 0",
+   "python": "mem.recall('q', 'u', limit=0)",
+   "typescript": "mem.recall('q', 'u', {limit: 0})",
+   "python_says": "limit must be an integer between 5 and 20, got 0. Out of range is refused rather than adjusted, so a short answer always means the store was short.",
+   "typescript_says": "limit must be an integer between 5 and 20, got 0. Out of range is refused rather than adjusted, so a short answer always means the store was short."
+  },
+  {
+   "case": "recall: limit 1000",
+   "python": "mem.recall('q', 'u', limit=1000)",
+   "typescript": "mem.recall('q', 'u', {limit: 1000})",
+   "python_says": "limit must be an integer between 5 and 20, got 1000. Out of range is refused rather than adjusted, so a short answer always means the store was short.",
+   "typescript_says": "limit must be an integer between 5 and 20, got 1000. Out of range is refused rather than adjusted, so a short answer always means the store was short."
+  },
+  {
+   "case": "recall: rooms bad",
+   "python": "mem.recall('q', 'u', rooms='kitchen')",
+   "typescript": "mem.recall('q', 'u', {rooms: 'kitchen'})",
+   "python_says": "rooms must be \"all\" or room names like \"m0\" (this morning) or \"a1\" and \"n1\" (yesterday afternoon and night), got \"kitchen\".",
+   "typescript_says": "rooms must be \"all\" or room names like \"m0\" (this morning) or \"a1\" and \"n1\" (yesterday afternoon and night), got \"kitchen\"."
+  },
+  {
+   "case": "recall: tz 99",
+   "python": "mem.recall('q', 'u', tz=99)",
+   "typescript": "mem.recall('q', 'u', {tz: 99})",
+   "python_says": "tz must be a UTC offset in hours between -14 and 14 (e.g. 9, -4, 5.5), got 99.",
+   "typescript_says": "tz must be a UTC offset in hours between -14 and 14 (e.g. 9, -4, 5.5), got 99."
+  },
+  {
+   "case": "get: no id",
+   "python": "mem.get('u', '')",
+   "typescript": "mem.get('u', '')",
+   "python_says": "memory_id is required \u2014 the id that add/store or list_memories returned. Note the argument order: get(user_id, memory_id). With a store set on the client, call get(memory_id=\"...\").",
+   "typescript_says": "memoryId is required \u2014 the id that add/store or listMemories returned. Note the argument order: get(userId, memoryId). With a store set on the client, call get(undefined, memoryId).",
+   "differs_by_idiom": "the keyword form differs: get(memory_id=...) and get(undefined, memoryId)",
+   "rust_says": "memory_id is required \u2014 the id that add/store or list_memories returned. Note the argument order: get(user_id, memory_id). With a store set on the client, call get(None, memory_id)."
+  },
+  {
+   "case": "delete: no id",
+   "python": "mem.delete('u', '')",
+   "typescript": "mem.delete('u', '')",
+   "python_says": "memory_id is required (non-blank). To delete every memory in a store, call delete_all(user_id) explicitly. Note the argument order: delete(user_id, memory_id).",
+   "typescript_says": "memoryId is required (non-blank). To delete every memory in a store, call deleteAll(userId) explicitly. Note the argument order: delete(userId, memoryId)."
+  },
+  {
+   "case": "delete_all: no store",
+   "python": "mem.delete_all('')",
+   "typescript": "mem.deleteAll('')",
+   "python_says": "user_id is required (a non-blank string) for delete_all \u2014 anything else would wipe the default store.",
+   "typescript_says": "userId is required (a non-blank string) for deleteAll \u2014 anything else would wipe the default store."
+  },
+  {
+   "case": "delete_store: no store",
+   "python": "mem.delete_store('')",
+   "typescript": "mem.deleteStore('')",
+   "python_says": "user_id is required (a non-blank string) \u2014 delete_store never falls back to the default store.",
+   "typescript_says": "userId is required (a non-blank string) \u2014 deleteStore never falls back to the default store."
+  },
+  {
+   "case": "list_memories: limit 0",
+   "python": "mem.list_memories('u', limit=0)",
+   "typescript": "mem.listMemories('u', {limit: 0})",
+   "python_says": "limit must be an integer between 1 and 500, got 0.",
+   "typescript_says": "limit must be an integer between 1 and 500, got 0."
+  },
+  {
+   "case": "list_memories: limit 5000",
+   "python": "mem.list_memories('u', limit=5000)",
+   "typescript": "mem.listMemories('u', {limit: 5000})",
+   "python_says": "limit must be an integer between 1 and 500, got 5000.",
+   "typescript_says": "limit must be an integer between 1 and 500, got 5000."
+  },
+  {
+   "case": "add_speaker: empty",
+   "python": "mem.add_speaker('', 'u')",
+   "typescript": "mem.addSpeaker('', 'u')",
+   "python_says": "speaker must be a speaker's name (a non-blank string), got \"\".",
+   "typescript_says": "speaker must be a speaker's name (a non-blank string), got \"\"."
+  },
+  {
+   "case": "add_speaker: line break",
+   "python": "mem.add_speaker('A\\nB', 'u')",
+   "typescript": "mem.addSpeaker('A\\nB', 'u')",
+   "python_says": "speaker contains a line break or a control character.",
+   "typescript_says": "speaker contains a line break or a control character."
+  },
+  {
+   "case": "remove_speaker: empty",
+   "python": "mem.remove_speaker('', 'u')",
+   "typescript": "mem.removeSpeaker('', 'u')",
+   "python_says": "speaker must be a speaker's name (a non-blank string), got \"\".",
+   "typescript_says": "speaker must be a speaker's name (a non-blank string), got \"\"."
+  },
+  {
+   "case": "relabel_speaker: 1001 ids",
+   "python": "mem.relabel_speaker('A', 'B', 'u', memory_ids=['m']*1001)",
+   "typescript": "mem.relabelSpeaker('A', 'B', 'u', {memoryIds: Array(1001).fill('m')})",
+   "python_says": "memory_ids must be a list of 1 to 1000 memory ids, got 1001 ids. Leave it out to relabel every memory under from_speaker.",
+   "typescript_says": "memoryIds must be a list of 1 to 1000 memory ids, got 1001 ids. Leave it out to relabel every memory under fromSpeaker."
+  },
+  {
+   "case": "forget_speaker: empty list",
+   "python": "mem.forget_speaker([], 'u')",
+   "typescript": "mem.forgetSpeaker([], 'u')",
+   "python_says": "speaker is required: one name, or a list of at least one name.",
+   "typescript_says": "speaker is required: one name, or a list of at least one name.",
+   "rust_says": "speakers is required: a list of at least one name."
+  },
+  {
+   "case": "forget_speaker: no store",
+   "python": "mem.forget_speaker('A', '')",
+   "typescript": "mem.forgetSpeaker('A', '')",
+   "python_says": "user_id is required (a non-blank string) for forget_speaker: it deletes everything that person said in the store, so it never falls back to the default store.",
+   "typescript_says": "userId is required (a non-blank string) for forgetSpeaker: it deletes everything that person said in the store, so it never falls back to the default store."
+  },
+  {
+   "case": "by_speaker: empty",
+   "python": "mem.by_speaker('', 'u')",
+   "typescript": "mem.bySpeaker('', 'u')",
+   "python_says": "speaker is required \u2014 \"me\" for the assistant, or a person's name.",
+   "typescript_says": "speaker is required \u2014 \"me\" for the assistant, or a person's name."
+  },
+  {
+   "case": "set_settings: nothing",
+   "python": "mem.set_settings('u')",
+   "typescript": "mem.setSettings('u')",
+   "python_says": "set_settings needs time_zone, default_speakers or both.",
+   "typescript_says": "setSettings needs timeZone, defaultSpeakers or both."
+  },
+  {
+   "case": "open_work: empty question",
+   "python": "mem.open_work('', 'u')",
+   "typescript": "mem.openWork('', 'u')",
+   "python_says": "question is required.",
+   "typescript_says": "question is required."
+  },
+  {
+   "case": "open_work: diversity bad",
+   "python": "mem.open_work('q', 'u', diversity='lots')",
+   "typescript": "mem.openWork('q', 'u', {diversity: 'lots'})",
+   "python_says": "diversity must be \"none\", \"mmr\", \"temporal\" or \"full\", got \"lots\".",
+   "typescript_says": "diversity must be \"none\", \"mmr\", \"temporal\" or \"full\", got \"lots\"."
+  },
+  {
+   "case": "open_work: max_images 99",
+   "python": "mem.open_work('q', 'u', max_images=99)",
+   "typescript": "mem.openWork('q', 'u', {maxImages: 99})",
+   "python_says": "max_images must be an integer between 0 and 5, got 99.",
+   "typescript_says": "maxImages must be an integer between 0 and 5, got 99."
+  },
+  {
+   "case": "work_search: no work",
+   "python": "mem.work_search('', 'q', 'u')",
+   "typescript": "mem.workSearch('', 'q', 'u')",
+   "python_says": "work_id is required.",
+   "typescript_says": "workId is required."
+  },
+  {
+   "case": "work_deeper: no work",
+   "python": "mem.work_deeper('', 'u')",
+   "typescript": "mem.workDeeper('', 'u')",
+   "python_says": "work_id is required.",
+   "typescript_says": "workId is required."
+  },
+  {
+   "case": "close_work: no work",
+   "python": "mem.close_work('', 'u')",
+   "typescript": "mem.closeWork('', 'u')",
+   "python_says": "work_id is required.",
+   "typescript_says": "workId is required."
+  },
+  {
+   "case": "revisions: include bad",
+   "python": "mem.revisions('u', include='all')",
+   "typescript": "mem.revisions('u', {include: 'all'})",
+   "python_says": "include must be \"revised\" or \"unrevised\", got \"all\".",
+   "typescript_says": "include must be \"revised\" or \"unrevised\", got \"all\"."
+  },
+  {
+   "case": "usage: days 0",
+   "python": "mem.usage(0)",
+   "typescript": "mem.usage(0)",
+   "python_says": "days must be an integer between 1 and 365, got 0.",
+   "typescript_says": "days must be an integer between 1 and 365, got 0."
+  },
+  {
+   "case": "usage: days 400",
+   "python": "mem.usage(400)",
+   "typescript": "mem.usage(400)",
+   "python_says": "days must be an integer between 1 and 365, got 400.",
+   "typescript_says": "days must be an integer between 1 and 365, got 400."
+  },
+  {
+   "case": "forget_image: no id",
+   "python": "mem.forget_image('u', '')",
+   "typescript": "mem.forgetImage('u', '')",
+   "python_says": "memory_id is required (non-blank) \u2014 the id of the memory whose image you want removed.",
+   "typescript_says": "memoryId is required (non-blank) \u2014 the id of the memory whose image you want removed."
+  },
+  {
+   "case": "get_image: no id",
+   "python": "mem.get_image('u', '')",
+   "typescript": "mem.getImage('u', '')",
+   "python_says": "memory_id is required (non-blank) \u2014 the id that add/store or list_images returned.",
+   "typescript_says": "memoryId is required (non-blank) \u2014 the id that add/store or listImages returned."
+  },
+  {
+   "case": "why: no id",
+   "python": "mem.why('', 'u')",
+   "typescript": "mem.why('', 'u')",
+   "python_says": "memory_id is required (non-blank) \u2014 the id a search, recall or work returned.",
+   "typescript_says": "memoryId is required (non-blank) \u2014 the id a search, recall or work returned."
+  },
+  {
+   "case": "around: no id",
+   "python": "mem.around('', 'u')",
+   "typescript": "mem.around('', 'u')",
+   "python_says": "memory_id is required (non-blank) \u2014 the id a search, recall or work returned.",
+   "typescript_says": "memoryId is required (non-blank) \u2014 the id a search, recall or work returned."
+  },
+  {
+   "case": "lineage: no id",
+   "python": "mem.lineage('u', '')",
+   "typescript": "mem.lineage('u', '')",
+   "python_says": "memory_id is required (non-blank) \u2014 the id that add/store or list_memories returned.",
+   "typescript_says": "memoryId is required (non-blank) \u2014 the id that add/store or listMemories returned."
+  }
+ ]
+}

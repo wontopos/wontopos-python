@@ -107,8 +107,8 @@ class UpdateNewContentTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase
 
 class AddSpeakerTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
     BAD = ({"speaker": "  "}, {"metadata": {"speaker": ""}}, {"speaker": "A" * 257})
-    SAID = ["speaker is required (a non-blank string).", "speaker is required (a non-blank string).",
-            "speaker is at most 256 bytes."]
+    SAID = ['speaker must be a speaker\'s name (a non-blank string), got "  ".',
+            'speaker must be a speaker\'s name (a non-blank string), got "".', "speaker is at most 256 bytes."]
 
     def test_add_checks_its_speaker_as_add_bulk_does(self):
         srv, mem = self.make([])
@@ -145,8 +145,10 @@ class AddSpeakerTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
 
 
 class SpeakerNamesTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
-    SAID = ["speaker is required (a non-blank string).", "speaker is required (a non-blank string).",
-            "speaker is at most 256 bytes.", "speaker is required.", "speaker is required."]
+    SAID = ['speaker must be a speaker\'s name (a non-blank string), got "  ".',
+            "speaker must be a speaker's name (a non-blank string), got null.", "speaker is at most 256 bytes.",
+            'speaker must be a speaker\'s name (a non-blank string), got "  ".',
+            "speaker must be a speaker's name (a non-blank string), got null."]
 
     @staticmethod
     def calls(mem):
@@ -187,7 +189,7 @@ class SpeakerNamesTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
 
 class SpeakerCapTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
     LONG = "A" * 257
-    SAID = ["default_speakers['user'] is at most 256 bytes.", "to_speaker is at most 256 bytes."]
+    SAID = ['default_speakers["user"] is at most 256 bytes.', "to_speaker is at most 256 bytes."]
 
     def calls(self, mem):
         return (lambda: mem.set_settings("u", default_speakers={"user": self.LONG}),

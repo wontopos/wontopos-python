@@ -25,7 +25,7 @@ import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
 from . import (
-    APIConnectionError, NotFoundError, RateLimitError, WosError, _JS_SPACE, _js_trim, _logger, _make_error, _time,
+    APIConnectionError, NotFoundError, RateLimitError, WosError, _JS_SPACE, _jq, _js_trim, _logger, _make_error, _time,
 )
 from ._checks import _ENV_KEYS, _HEADER_CTL_RE, _NO_BODY_STATUS, _check_model, _idem_headers, _json_default, _warn_lock
 
@@ -262,7 +262,7 @@ def _check_base_url(base_url: Any) -> str:
         raise ValueError("base_url must be a non-empty string")
     if "\\" in base_url or any(c in _JS_SPACE for c in base_url) or _HEADER_CTL_RE.search(base_url):
         raise ValueError(
-            f"base_url {_shown_base(base_url)!r} contains whitespace, a backslash or a "
+            f"base_url {_jq(_shown_base(base_url))} contains whitespace, a backslash or a "
             "control character. Check for a stray space, newline or paste error."
         )
     base = base_url.rstrip("/")

@@ -29,7 +29,7 @@ _warned_store_ids: "dict" = {}
 def _assert_usable_store_id(user_id: Any) -> None:
     if not isinstance(user_id, str) or not _js_trim(user_id):
         raise ValueError(
-            f"user_id must be a non-blank string; got {user_id!r}. Omit it to use the client's default "
+            f"user_id must be a non-blank string; got {_jq(user_id)}. Omit it to use the client's default "
             "store, or pass a real store id — anything else would silently write into the default store."
         )
 
@@ -112,22 +112,23 @@ def _json_default(o: Any) -> Any:
     raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
 
 
+def _shown(v: Any) -> str:
+    """A value as an error message shows it: a string in quotes, so "5" does not read as 5."""
+    return _jq(v) if isinstance(v, str) else _js_str(v)
+
+
 def _check_count(limit: int, name: str = "limit") -> None:
-    if not _is_int(limit):
-        raise ValueError(f"{name} must be an int, got {type(limit).__name__}")
-    if limit < SEARCH_LIMIT_MIN or limit > SEARCH_LIMIT_MAX:
+    if not _is_int(limit) or limit < SEARCH_LIMIT_MIN or limit > SEARCH_LIMIT_MAX:
         raise ValueError(
-            f"{name} must be an integer between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {limit}. "
+            f"{name} must be an integer between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {_shown(limit)}. "
             "Out of range is refused rather than adjusted, so a short answer always "
             "means the store was short."
         )
 
 
 def _check_context_limit(n: int) -> None:
-    if not _is_int(n):
-        raise ValueError(f"context_limit must be an int, got {type(n).__name__}")
-    if n < CONTEXT_LIMIT_MIN or n > CONTEXT_LIMIT_MAX:
-        raise ValueError(f"context_limit must be an integer between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {n}.")
+    if not _is_int(n) or n < CONTEXT_LIMIT_MIN or n > CONTEXT_LIMIT_MAX:
+        raise ValueError(f"context_limit must be an integer between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {_shown(n)}.")
 
 
 _PAGE_MIN, _PAGE_MAX = 5, 20
@@ -138,7 +139,7 @@ _VERIFY_MAX = 3
 
 def _check_int(value: Any, name: str, lo: int, hi: int) -> None:
     if not _is_int(value) or not lo <= value <= hi:
-        raise ValueError(f"{name} must be an integer between {lo} and {hi}, got {_js_str(value)}.")
+        raise ValueError(f"{name} must be an integer between {lo} and {hi}, got {_shown(value)}.")
 
 
 def _check_page(value: Any, name: str = "limit") -> None:
@@ -159,7 +160,7 @@ def _page_fields(limit: Any, before: Any, skip_ids: Any) -> dict:
 
 def _check_include(include: Any) -> None:
     if include is not None and include not in ("revised", "unrevised"):
-        raise ValueError(f'include must be "revised" or "unrevised", got {include!r}.')
+        raise ValueError(f'include must be "revised" or "unrevised", got {_jq(include)}.')
 
 
 def _list_size(value: Any, name: str) -> int:
@@ -278,10 +279,15 @@ def _one_line_speaker(name: str, what: str) -> str:
     return name
 
 
-def _turn_speaker(value: Any, name: str) -> str:
+def _speaker_arg(value: Any, name: str) -> str:
+    """A speaker's name an argument gives, trimmed; the refusal TypeScript and Rust give too."""
     if not isinstance(value, str) or not value.strip(_JS_SPACE):
-        raise ValueError(f"{name} is required (a non-blank string).")
-    s = value.strip(_JS_SPACE)
+        raise ValueError(f"{name} must be a speaker's name (a non-blank string), got {_jq(value)}.")
+    return value.strip(_JS_SPACE)
+
+
+def _turn_speaker(value: Any, name: str) -> str:
+    s = _speaker_arg(value, name)
     if len(s.encode("utf-8", "surrogatepass")) > 256:
         raise ValueError(f"{name} is at most 256 bytes.")
     return _one_line_speaker(s, name)
@@ -310,7 +316,8 @@ def _turn_time(value: Any, name: str) -> str:
     if m is None or not _real_time(s) or int(m.group(1) or 0) > 23 or int(m.group(2) or 0) > 59:
         raise ValueError(
             f"{name} must be a datetime with a time zone or an RFC 3339 time with Z or a ±hh:mm offset, "
-            f"such as 2026-05-02T09:00:00Z; a plain date or a time with no offset is refused, got {value!r}."
+            "such as 2026-05-02T09:00:00Z (a date alone, a time with no offset, and a space or a small t in place of "
+            f"the T are refused), got {_jq(value)}."
         )
     return s
 
@@ -491,12 +498,17 @@ def _warn_on_unknown_metadata(md: dict) -> None:
 
 
 def _metadata(metadata: Optional[dict], extra: dict, created_at: Any = None) -> dict:
+    # What `{**metadata}` takes passes: a dict, a Mapping, or anything with keys() and [] (sqlite3.Row).
+    if metadata is not None and not (
+        isinstance(metadata, Mapping) or (hasattr(metadata, "keys") and hasattr(metadata, "__getitem__"))
+    ):
+        raise ValueError(f"metadata must be a dict, got {type(metadata).__name__}. Nothing was sent.")
     bad = sorted(k for k in {**(metadata or {}), **extra} if _names_a_store(k))
     extra = {k: v for k, v in extra.items() if v is not None}
     md = {**metadata, **extra} if metadata else extra
     if bad:
         raise ValueError(
-            f"{bad[0]!r} is not a metadata field: pass the store as user_id= and an "
+            f"{_jq(bad[0])} is not a metadata field: pass the store as user_id= and an "
             "idempotency key as idempotency_key=. Nothing was sent."
         )
     for side in _TURN_SIDES:
@@ -528,13 +540,13 @@ def _edit_within(a: str, b: str, max_edits: int) -> bool:
 def _check_search_opts(opts: dict) -> None:
     for k in opts:
         if k in _RESERVED_SEARCH_KEYS:
-            raise ValueError(f"{k!r} is set by the call, not by options — pass it as an argument.")
+            raise ValueError(f"{_jq(k)} is set by the call, not by options — pass it as an argument.")
         if k in _KNOWN_SEARCH_KEYS:
             continue
         near = next((n for n in sorted(_KNOWN_SEARCH_KEYS) if n != "extra" and _edit_within(k, n, 2)), None)
         raise ValueError(
-            f"unknown search option {k!r}"
-            + (f" — did you mean {near!r}?" if near else "")
+            f"unknown search option {_jq(k)}"
+            + (f" — did you mean {_jq(near)}?" if near else "")
             + ". The service drops keys it does not know and answers anyway, so this "
             "would have looked like it worked. Pass it under 'extra' if the service "
             "accepts it and this client does not know it yet."
@@ -570,14 +582,14 @@ _DEFAULT_SPEAKER_KEYS = ("user", "assistant")
 
 def _default_speakers(value: Any) -> dict:
     if not isinstance(value, Mapping) or not value:
-        raise ValueError(f'default_speakers must be a dict with "user", "assistant" or both, got {value!r}.')
+        raise ValueError(f'default_speakers must be a dict with "user", "assistant" or both, got {_jq(value)}.')
     out: dict = {}
     for k, v in value.items():
         if k not in _DEFAULT_SPEAKER_KEYS:
-            raise ValueError(f'default_speakers takes "user" and "assistant" only, got {k!r}.')
+            raise ValueError(f'default_speakers takes "user" and "assistant" only, got {_jq(k)}.')
         if v is not None and (not isinstance(v, str) or not _js_trim(v)):
-            raise ValueError(f"default_speakers[{k!r}] must be a speaker's name, or None to clear it, got {v!r}.")
-        out[k] = None if v is None else _turn_speaker(v, f"default_speakers[{k!r}]")
+            raise ValueError(f"default_speakers[{_jq(k)}] must be a speaker's name, or None to clear it, got {_jq(v)}.")
+        out[k] = None if v is None else _turn_speaker(v, f"default_speakers[{_jq(k)}]")
     return out
 
 
@@ -598,13 +610,14 @@ _RELABEL_IDS_MAX = 1000
 
 
 def _relabel_body(store_id: str, from_speaker: Any, to_speaker: Any, memory_ids: Any) -> dict:
-    body: dict = {"user_id": store_id, "from": _required(from_speaker, "from_speaker"),
-                  "to": _turn_speaker(_required(to_speaker, "to_speaker"), "to_speaker")}
+    body: dict = {"user_id": store_id, "from": _speaker_arg(from_speaker, "from_speaker"),
+                  "to": _turn_speaker(to_speaker, "to_speaker")}
     if memory_ids is not None:
         if not isinstance(memory_ids, (list, tuple)):
             raise ValueError(f"memory_ids must be a list of memory ids, got {type(memory_ids).__name__}.")
         if not 1 <= len(memory_ids) <= _RELABEL_IDS_MAX:
-            raise ValueError(f"memory_ids must hold 1 to {_RELABEL_IDS_MAX} memory ids, got {len(memory_ids)}.")
+            raise ValueError(f"memory_ids must be a list of 1 to {_RELABEL_IDS_MAX} memory ids, got {len(memory_ids)} ids. "
+                             "Leave it out to relabel every memory under from_speaker.")
         body["memory_ids"] = [_required(m, f"memory_ids[{i}]") for i, m in enumerate(memory_ids)]
     return body
 
@@ -613,8 +626,8 @@ def _speaker_names(speaker: Any) -> list:
     many = isinstance(speaker, (list, tuple))
     names = list(speaker) if many else [speaker]
     if not names:
-        raise ValueError("speaker must be a name or a list of names, got an empty list.")
-    return [_required(n, f"speaker[{i}]" if many else "speaker") for i, n in enumerate(names)]
+        raise ValueError("speaker is required: one name, or a list of at least one name.")
+    return [_speaker_arg(n, f"speaker[{i}]" if many else "speaker") for i, n in enumerate(names)]
 
 
 def _named_store(user_id: Any, refusal: str) -> str:
@@ -626,7 +639,8 @@ def _named_store(user_id: Any, refusal: str) -> str:
 
 def _forget_speaker_body(speaker: Any, user_id: Any, preview: Any) -> dict:
     user_id = _named_store(
-        user_id, "user_id is required (a non-blank string) for forget_speaker — it never falls back to the default store."
+        user_id, "user_id is required (a non-blank string) for forget_speaker: it deletes everything that person said in "
+        "the store, so it never falls back to the default store."
     )
     body: dict = {"user_id": user_id, "speakers": _speaker_names(speaker)}
     if _check_flag(preview, "preview"):
@@ -658,7 +672,7 @@ def _segments(segments: Any) -> list:
             )
         for k in s:
             if k not in _SEGMENT_KEYS:
-                raise ValueError(f"segments[{i}] has {k!r}, which a piece does not take: only content, "
+                raise ValueError(f"segments[{i}] has {_jq(k)}, which a piece does not take: only content, "
                                  "speaker and created_at.")
         content = s.get("content")
         if not isinstance(content, str) or not _js_trim(content):
@@ -717,7 +731,7 @@ def _idem_headers(key: Optional[str]) -> Optional[dict]:
     if key is None:
         return None
     if not isinstance(key, str) or not _IDEMPOTENCY_KEY_RE.fullmatch(key):
-        raise ValueError(f"invalid idempotency_key: {key!r} — 1-128 chars of [A-Za-z0-9._:-]")
+        raise ValueError(f"invalid idempotency_key: {_jq(key)} — 1-128 chars of [A-Za-z0-9._:-]")
     return {"Idempotency-Key": key}
 _NO_BODY_STATUS = frozenset({204, 205, 304})
 _MODEL_RE = re.compile(r"[A-Za-z0-9._-]+")
@@ -739,7 +753,7 @@ def _clean_key(api_key: str) -> str:
     if not key.isascii():
         bad = next(c for c in key if not c.isascii())
         raise ValueError(
-            f"api_key contains a non-ASCII character ({bad!r}) - rich text turns '-' into an en dash; "
+            f"api_key contains a non-ASCII character ({_jq(bad)}) - rich text turns '-' into an en dash; "
             "copy the key from a plain-text field"
         )
     if key.startswith("sk-"):
@@ -750,7 +764,7 @@ def _clean_key(api_key: str) -> str:
 
 def _check_model(model: Optional[str]) -> Optional[str]:
     if model and not _MODEL_RE.fullmatch(model):
-        raise ValueError(f"invalid model name: {model!r} (letters, digits, '.', '_', '-' only)")
+        raise ValueError(f"invalid model name: {_jq(model)} (letters, digits, '.', '_', '-' only)")
     return model
 
 
@@ -879,7 +893,7 @@ def _byte_length(s: str) -> int:
 
 def _sleep_slot(slot: Any, what: str = "slot") -> int:
     if not _is_int(slot) or not 0 <= slot <= 4:
-        raise ValueError(f"{what} must be 0 (the core) or 1 to 4 (a box), got {slot!r}.")
+        raise ValueError(f"{what} must be 0 (the core) or 1 to 4 (a box), got {_jq(slot)}.")
     return int(slot)
 
 
@@ -887,7 +901,7 @@ def _sleep_open_body(store: str, slot: Any, version: Any) -> dict:
     body: dict = {"user_id": store, "slot": _sleep_slot(slot)}
     if version is not None:
         if not _is_int(version) or version < 1:
-            raise ValueError(f"version must be a whole number of 1 or more, got {version!r}.")
+            raise ValueError(f"version must be a whole number of 1 or more, got {_jq(version)}.")
         body["version"] = int(version)
     return body
 
@@ -910,7 +924,7 @@ def _sleep_writes(writes: Any) -> list:
         slots.add(slot)
         base = w.get("base_version")
         if not _is_int(base) or base < 0:
-            raise ValueError(f"{what}.base_version must be the version read, 0 or more, got {base!r}.")
+            raise ValueError(f"{what}.base_version must be the version read, 0 or more, got {_jq(base)}.")
         entry: dict = {"slot": slot, "base_version": int(base)}
         for key in ("title", "body"):
             v = w.get(key, "" if key == "title" else None)
@@ -923,7 +937,7 @@ def _sleep_writes(writes: Any) -> list:
         entry["evidence"] = list(ev)
         if w.get("day") is not None:
             if _sleep_date(w["day"]) is None:
-                raise ValueError(f'{what}.day must be "YYYY-MM-DD", got {w["day"]!r}.')
+                raise ValueError(f'{what}.day must be "YYYY-MM-DD", got {_jq(w["day"])}.')
             entry["day"] = w["day"]
         out.append(entry)
     return out
@@ -931,7 +945,7 @@ def _sleep_writes(writes: Any) -> list:
 
 def _sleep_notes_body(store: str, base_version: Any, notes: Any) -> dict:
     if not _is_int(base_version) or base_version < 0:
-        raise ValueError(f"base_version must be the version read, 0 or more, got {base_version!r}.")
+        raise ValueError(f"base_version must be the version read, 0 or more, got {_jq(base_version)}.")
     if not isinstance(notes, Mapping):
         raise ValueError("notes must be a dict: proposals and mixed.")
     return {"user_id": store, "base_version": int(base_version), "notes": dict(notes)}

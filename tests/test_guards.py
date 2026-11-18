@@ -186,7 +186,7 @@ class BaseUrlQueryTest(unittest.TestCase):
                     self.assertNotIn("abc123", str(cm.exception))
 
     def test_a_base_url_refusal_that_prints_the_url_leaves_out_its_query_its_anchor_and_its_userinfo(self):
-        said = ("base_url {!r} contains whitespace, a backslash or a control character. "
+        said = ('base_url "{}" contains whitespace, a backslash or a control character. '
                 "Check for a stray space, newline or paste error.")
         for bad, shown in (("https://me:hunter2@api.wontopos.com/v 1?token=abc123#x", "https://***@api.wontopos.com/v 1?"),
                            ("https://api.wontopos.com/v1?token=abc 123", "https://api.wontopos.com/v1?"),
@@ -217,7 +217,7 @@ class BaseUrlQueryTest(unittest.TestCase):
                     self.assertEqual(str(cm.exception), provider + json.dumps(shown))
 
     def test_a_password_holding_a_question_mark_or_a_hash_is_masked_before_the_url_is_cut(self):
-        said = ("base_url {!r} contains whitespace, a backslash or a control character. "
+        said = ('base_url "{}" contains whitespace, a backslash or a control character. '
                 "Check for a stray space, newline or paste error.")
         for bad in ("https://me:hun?ter2@api.wontopos.com/v 1", "https://me:hun#ter2@api.wontopos.com/v 1"):
             for cls in CLASSES:
@@ -432,7 +432,7 @@ class SpeakerLineTest(unittest.IsolatedAsyncioTestCase):
         ("speaker", lambda m: m.add("hi", "u", speaker="Dana\x1bx")),
         ("speaker", lambda m: m.add_speaker("Dana\x85x", "u")),
         ("to_speaker", lambda m: m.relabel_speaker("Dana", "Dana\tx", "u")),
-        ("default_speakers['assistant']", lambda m: m.set_settings("u", default_speakers={"assistant": "Wren\N{PARAGRAPH SEPARATOR}x"})),
+        ('default_speakers["assistant"]', lambda m: m.set_settings("u", default_speakers={"assistant": "Wren\N{PARAGRAPH SEPARATOR}x"})),
         ("speaker", lambda m: m.add_bulk("text", "u", speaker="Dana\x01")),
         ('segments[0]["speaker"]', lambda m: m.add_bulk(user_id="u", segments=[{"content": "x", "speaker": "Dana\x7f"}])),
     )

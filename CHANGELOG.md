@@ -6,6 +6,27 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.53 — 2026-11-18
+
+**More of the three SDKs' refusals say the same thing in the same words, and a metadata that is not a dict is refused.**
+
+- A `metadata` that is not a dict (an object in TypeScript and Rust) is refused before
+  anything is sent: `metadata must be a dict, got str. Nothing was sent.` (`must be an
+  object` in TypeScript and Rust). TypeScript and Rust sent it. Python sent an empty or
+  false one (`[]`, `""`, `0`, `False`) as no metadata, so such a call that went through
+  before raises now, and raised a `TypeError` from inside the call for the rest; it raises
+  `ValueError` for all of them. Anything with `keys()` and `[]`, such as a `sqlite3.Row`,
+  still passes in Python.
+- What a refusal said in one language it now says in all three: the order of `get`'s
+  arguments, where a memory id comes from, why `forget_speaker` always takes a store, how
+  many ids `relabel_speaker` takes, what a speaker's name must be in `add_turn`,
+  `remove_speaker`, `relabel_speaker` and `forget_speaker`, and that a time needs an offset
+  and a capital `T`. Python shows the refused value there in double quotes, as TypeScript
+  and Rust do, and so does Rust's refusal of a key with a character that is not ASCII. The
+  other errors keep their classes.
+- In Python and TypeScript the memory calls show a count given as a string (`"5"`) in quotes
+  when they refuse it, so it no longer reads as the number 5.
+
 ## 2.2.52 — 2026-11-16
 
 **Python reads a response's headers as they arrive, and an imported code skill waits for a person's yes.**

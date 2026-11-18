@@ -9,7 +9,7 @@ from . import (
     _LISTED_NEEDS_ID, _MAX_PAGES, _NO_ID, _around_body, _as_records, _bulk_body, _check_include, _cursor_repeats,
     _default_tz, _form_body, _id_body, _is_int, _js_str, _js_trim, _list_size, _memory_from_get, _memory_page,
     _merge_results, _metadata, _named_store, _normalize_image, _page_fields, _recall_body, _recall_shape,
-    _require_memory_id, _required, _retrievals_body, _search_body, _supersede_body, _truncated, _turn_body,
+    _require_memory_id, _required, _retrievals_body, _search_body, _shown, _supersede_body, _truncated, _turn_body,
     _window_line, _with_records, _work_result, _write_extras,
 )
 
@@ -65,7 +65,7 @@ def _list_memories_body(client: Any, user_id: Optional[str], limit: Optional[int
 
 def _usage_path(days: Any) -> str:
     if not _is_int(days) or not 1 <= days <= 365:
-        raise ValueError(f"days must be an integer between 1 and 365, got {_js_str(days)}.")
+        raise ValueError(f"days must be an integer between 1 and 365, got {_shown(days)}.")
     return f"/api/v1/won/usage?days={days}"
 
 
@@ -91,7 +91,7 @@ def _add_body(client: Any, content: str, user_id: Optional[str], metadata: Optio
 def _by_speaker_body(client: Any, speaker: Any, user_id: Optional[str], limit: Optional[int],
                      before: Optional[str], skip_ids: Optional[list]) -> dict:
     if not isinstance(speaker, str) or not _js_trim(speaker):
-        raise ValueError('speaker is required — "me" for the assistant, or a person\'s name')
+        raise ValueError('speaker is required — "me" for the assistant, or a person\'s name.')
     page = _page_fields(limit, before, skip_ids)
     return {"user_id": client._uid(user_id), "speaker": _js_trim(speaker), **page}
 

@@ -13,7 +13,7 @@ from . import (
     _nests_deeper, _no_constant,
 )
 from ._checks import (
-    _AROUND_MAX, _AROUND_MIN, _as_records, _byte_length, _check_rooms, _one_line_speaker, _open_work_body,
+    _AROUND_MAX, _AROUND_MIN, _as_records, _byte_length, _check_rooms, _one_line_speaker, _open_work_body, _shown,
     _tools_diversity, _tz_minutes,
 )
 from ._http import _paid_calls
@@ -45,7 +45,7 @@ def _tools_assistant(value: Any) -> Optional[str]:
     if value is None:
         return None
     if not isinstance(value, str) or not _js_trim(value):
-        raise ValueError(f"assistant is required (a non-blank speaker name), got {value!r}.")
+        raise ValueError(f"assistant must be a speaker's name (a non-blank string), got {_jq(value)}.")
     s = _js_trim(value)
     if _byte_length(s) > _SPEAKER_MAX_BYTES:
         raise ValueError(f"assistant is at most {_SPEAKER_MAX_BYTES} bytes.")
@@ -190,7 +190,7 @@ def _tool_int(v: Any, name: str, lo: int, hi: int) -> int:
     x = _js_number(v)
     if isinstance(x, int) and lo <= x <= hi:
         return x
-    raise ValueError(f"{name} must be an integer between {lo} and {hi}, got {_js_str(x)}.")
+    raise ValueError(f"{name} must be an integer between {lo} and {hi}, got {_shown(x)}.")
 
 
 _DATE_PARSE = re.compile(

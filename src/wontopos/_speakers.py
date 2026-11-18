@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Optional, Sequence, Union
 
-from . import _forget_speaker_body, _relabel_body, _required, _settings_body, _turn_speaker, _with_records
+from . import _forget_speaker_body, _relabel_body, _required, _settings_body, _speaker_arg, _turn_speaker, _with_records
 
 
 class _SpeakerCalls:
@@ -32,7 +32,7 @@ class _SpeakerCalls:
 
     def remove_speaker(self, speaker: str, user_id: Optional[str] = None) -> dict:
         """Unregister a person; their memories stay."""
-        speaker = _required(speaker, "speaker")
+        speaker = _speaker_arg(speaker, "speaker")
         return self._request(
             "DELETE", "/api/v1/memory/speakers", json_body={"user_id": self._uid(user_id), "speaker": speaker}
         )
@@ -78,7 +78,7 @@ class _AsyncSpeakerCalls:
 
     async def remove_speaker(self, speaker: str, user_id: Optional[str] = None) -> dict:
         """Unregister a person; their memories stay."""
-        speaker = _required(speaker, "speaker")
+        speaker = _speaker_arg(speaker, "speaker")
         return await self._request(
             "DELETE", "/api/v1/memory/speakers", json_body={"user_id": self._uid(user_id), "speaker": speaker}
         )
