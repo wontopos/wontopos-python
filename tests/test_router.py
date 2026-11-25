@@ -1108,6 +1108,11 @@ class RouterCases:
         for n in ("1e999", "-1e999", "NaN"):
             self.assertEqual(await done(tools.run({"name": "ask", "arguments": '{"request": "Fly me", "n": ' + n + "}"})),
                              '{"ok":false,"text":"Refused: the arguments are not JSON."}', n)
+        deep = "x"
+        for _ in range(127):
+            deep = [deep]
+        self.assertEqual(await done(tools.run({"name": "ask", "input": {"request": "Fly me", "extra": deep}})),
+                         '{"ok":false,"text":"Refused: the arguments are not JSON."}')
         await self.raises(ValueError, "not the ask tool", lambda: tools.run({"name": "memory_search", "input": {}}))
         with self.assertRaises(TypeError):
             mem.router_tools(None, trun=1)
@@ -1414,8 +1419,8 @@ class RouterCases:
         oai = openai_caller(base_url="https://api.openai.com/v1", api_key="sk-test-3333333333333", model="gpt-5",
                             reasoning_effort=True)
 
-        def post(url, headers, body, signal, reason_of=None):
-            sent.append((url, headers, body))
+        def post(url, body, signal, reason_of=None):
+            sent.append((url, dict(oai._headers), body))
             return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
 
         oai._post = post

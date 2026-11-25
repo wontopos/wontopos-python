@@ -191,7 +191,8 @@ class _MemoryCalls:
                             long_term=long_term, long_term_cutoff=long_term_cutoff,
                             today_start=today_start, now=now, short_term_limit=short_term_limit,
                             short_term_budget_tokens=short_term_budget_tokens, max_images=max_images,
-                            filters=filters, speaker=speaker, include_superseded=include_superseded)
+                            filters=filters, speaker=speaker, include_superseded=include_superseded,
+                            model=model or self._model)
         return _recall_shape(self._post("/api/v1/memory/recall", body, model=model))
 
     def engram(
@@ -434,7 +435,8 @@ class _AsyncMemoryCalls:
                             long_term=long_term, long_term_cutoff=long_term_cutoff,
                             today_start=today_start, now=now, short_term_limit=short_term_limit,
                             short_term_budget_tokens=short_term_budget_tokens, max_images=max_images,
-                            filters=filters, speaker=speaker, include_superseded=include_superseded)
+                            filters=filters, speaker=speaker, include_superseded=include_superseded,
+                            model=model or self._model)
         return _recall_shape(await self._post("/api/v1/memory/recall", body, model=model))
 
     async def engram(

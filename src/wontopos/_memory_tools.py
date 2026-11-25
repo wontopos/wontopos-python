@@ -13,8 +13,8 @@ from . import (
     _nests_deeper, _no_constant,
 )
 from ._checks import (
-    _AROUND_MAX, _AROUND_MIN, _as_records, _byte_length, _check_rooms, _one_line_speaker, _open_work_body, _shown,
-    _tools_diversity, _tz_minutes,
+    _AROUND_MAX, _AROUND_MIN, _RECENT_TURNS, _RECENT_TURNS_MAX, _as_records, _byte_length, _check_int, _check_rooms,
+    _one_line_speaker, _open_work_body, _shown, _tools_diversity, _tz_minutes,
 )
 from ._http import _paid_calls
 from .sleep import (
@@ -55,7 +55,7 @@ def _tools_assistant(value: Any) -> Optional[str]:
 def _memory_tools_args(client: Any, user_id: Optional[str], tz: Any, rooms: Any, speakers: Any = False,
                        dates: Any = False, images: Any = False, preset: Any = None, sleep: Any = False,
                        today: Any = None, assistant: Any = None, seen: Any = False, usage: Any = False,
-                       own_words: Any = None, diversity: Any = None) -> tuple:
+                       own_words: Any = None, diversity: Any = None, recent_turns: Any = None) -> tuple:
     assistant = _tools_assistant(assistant)
     tag, tools_client = _memory_preset(client, preset)
     if rooms is not None:
@@ -78,7 +78,7 @@ def _memory_tools_args(client: Any, user_id: Optional[str], tz: Any, rooms: Any,
         if not sleep:
             raise ValueError("today is the day the sleep's files are dated to: it goes with sleep=True.")
     return (tools_client, client._uid(user_id), tz, rooms, speakers, dates, images, tag, sleep, day, assistant, seen, usage,
-            own_words, diversity)
+            own_words, diversity, recent_turns)
 
 
 def _memory_note(speakers: bool, dates: bool, images: bool = False) -> str:
@@ -125,7 +125,7 @@ _NOT_JSON = "Refused: the arguments are not JSON."
 _MISSING = object()
 
 _ROOMS_SPLIT = re.compile(f"[{_JS_SPACE},]+")
-_NUMBER_TEXT = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?Infinity")
+_NUMBER_TEXT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?Infinity")
 _RADIX_TEXT = re.compile(r"0(?:[xX][0-9a-fA-F]+|[oO][0-7]+|[bB][01]+)")
 _DAY_MS = 86_400_000
 _NO_DAY = object()
@@ -307,7 +307,8 @@ _SHOWN_PICTURES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 def _photo_blocks(n: int, data: bytes, content_type: str, openai: bool) -> list:
     mime = (content_type or "").split(";")[0].strip().lower()
     if mime not in _SHOWN_PICTURES:
-        raise ValueError(f"[{_pad2(n)}] is a picture of a kind that cannot be shown ({mime or 'unknown'}).")
+        named = "unknown" if mime in ("", "application/octet-stream") else mime
+        raise ValueError(f"[{_pad2(n)}] is a picture of a kind that cannot be shown ({named}).")
     b64 = base64.b64encode(data).decode("ascii")
     if openai:
         return [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]
@@ -327,6 +328,9 @@ def _window_lines(turns: Any) -> list:
         held = n if reply and _is_integer(n) and n >= 0 else None
         out.append((at, f"#{len(out) + 1} {who}: {_kept_in(_text(t.get('content')))}", held))
     return out
+
+
+_RECENT_OFF = "The recent conversation is not shown here."
 
 
 def _recent_text(lines: list) -> str:
@@ -444,10 +448,14 @@ class _MemoryToolsBase:
                  rooms: Optional[Union[str, bool, Sequence[str]]], speakers: bool = False, dates: bool = False,
                  images: bool = False, preset: str = "S-2", sleep: bool = False, today: Any = None,
                  assistant: Optional[str] = None, seen: bool = False, usage: bool = False,
-                 own_words: Optional[bool] = None, diversity: Optional[str] = None):
+                 own_words: Optional[bool] = None, diversity: Optional[str] = None,
+                 recent_turns: Optional[int] = None):
+        if recent_turns is not None:
+            _check_int(recent_turns, "recent_turns", 0, _RECENT_TURNS_MAX)
         kind = _MEMORY_PRESETS[preset]
         self._client = client
         self._seen = bool(seen)
+        self._recent_turns = _RECENT_TURNS if recent_turns is None else recent_turns
         self._usage = bool(usage)
         self._own_words = kind["own_words"] if own_words is None else bool(own_words)
         self._diversity = kind["diversity"] if diversity is None else diversity
@@ -574,6 +582,8 @@ class _MemoryToolsBase:
                     raw = _json_loads(arguments)
                 except (ValueError, RecursionError):
                     return name, {}, _NOT_JSON
+        elif _nests_deeper(raw, 127):
+            return name, {}, _NOT_JSON
         args = raw if isinstance(raw, Mapping) else {}
         free = ("open_box", "memory_usage") + _SEEN_TOOLS
         return name, args, (_NOTHING_OPEN if self._work is None and name not in free else None)
@@ -657,7 +667,10 @@ class _MemoryToolsBase:
                     return text
                 return self._box_text(slot, (yield "open_sleep_file", (slot, self._store), {}))
             if name == "memory_recent":
-                self._recent = _window_lines((yield "history", (self._store,), {}))
+                if not self._recent_turns:
+                    self._recent = []
+                    return _RECENT_OFF
+                self._recent = _window_lines((yield "history", (self._store,), {}))[:self._recent_turns]
                 return _recent_text(self._recent)
             if name == "memory_seen":
                 n, at, head = self._seen_pick(args)
@@ -805,7 +818,6 @@ class _MemoryToolsBase:
         out = []
         day: Any = _NO_DAY
         zone = ""
-        minute = None
         for i, (_, _, date, time, own_zone, _, text) in enumerate(said):
             if time is not None:
                 z = own_zone or ""
@@ -815,11 +827,8 @@ class _MemoryToolsBase:
                 z = next((s[4] for s in said[i:] if s[2] == date and s[3] is not None), None) or ""
             if date != day or (time is not None and z != zone):
                 out.append("(no date)" if date is None else f"{date} {z}" if z else date)
-                day, zone, minute = date, z, None
-            head = "" if time is None else "      " if time == minute else f"{time} "
-            if time is not None:
-                minute = time
-            out.append(head + text)
+                day, zone = date, z
+            out.append(text if time is None else f"{time} {text}")
         return "\n".join(out)
 
 
@@ -904,6 +913,7 @@ class _MemoryToolsCalls:
         rooms: Optional[Union[str, bool, Sequence[str]]] = None, speakers: bool = False, dates: bool = False,
         images: bool = False, sleep: bool = False, today: Optional[str] = None, assistant: Optional[str] = None,
         seen: bool = False, usage: bool = False, own_words: Optional[bool] = None, diversity: Optional[str] = None,
+        recent_turns: Optional[int] = None,
     ) -> "MemoryTools":
         """Memory tools an LLM uses to look through a store by itself.
         ``preset``: "S-2-live" is for everyday conversation: its first look searches with the question and the last
@@ -913,9 +923,12 @@ class _MemoryToolsCalls:
         ``own_words``: whether every work these tools open may bring the assistant's own lines (default: off on
         S-2-live, on on S-2).
         ``diversity``: the diversity every work these tools open asks for, "none", "mmr", "temporal" or "full"
-        (default: "full" on S-2-live; unset on S-2, so none is sent)."""
+        (default: "full" on S-2-live; unset on S-2, so none is sent).
+        ``recent_turns``: how many lines of the recent conversation ``memory_recent`` shows, the newest first, 0 to
+        100 (default 50; 0 shows none, and the window is not read for it). ``memory_recent`` comes with
+        ``seen=True``: without it this sets nothing."""
         return MemoryTools(*_memory_tools_args(self, user_id, tz, rooms, speakers, dates, images, preset, sleep, today,
-                                               assistant, seen, usage, own_words, diversity))
+                                               assistant, seen, usage, own_words, diversity, recent_turns))
 
 
 class _AsyncMemoryToolsCalls:
@@ -924,6 +937,7 @@ class _AsyncMemoryToolsCalls:
         rooms: Optional[Union[str, bool, Sequence[str]]] = None, speakers: bool = False, dates: bool = False,
         images: bool = False, sleep: bool = False, today: Optional[str] = None, assistant: Optional[str] = None,
         seen: bool = False, usage: bool = False, own_words: Optional[bool] = None, diversity: Optional[str] = None,
+        recent_turns: Optional[int] = None,
     ) -> "AsyncMemoryTools":
         """Memory tools an LLM uses to look through a store by itself.
         ``preset``: "S-2-live" is for everyday conversation: its first look searches with the question and the last
@@ -933,6 +947,9 @@ class _AsyncMemoryToolsCalls:
         ``own_words``: whether every work these tools open may bring the assistant's own lines (default: off on
         S-2-live, on on S-2).
         ``diversity``: the diversity every work these tools open asks for, "none", "mmr", "temporal" or "full"
-        (default: "full" on S-2-live; unset on S-2, so none is sent)."""
+        (default: "full" on S-2-live; unset on S-2, so none is sent).
+        ``recent_turns``: how many lines of the recent conversation ``memory_recent`` shows, the newest first, 0 to
+        100 (default 50; 0 shows none, and the window is not read for it). ``memory_recent`` comes with
+        ``seen=True``: without it this sets nothing."""
         return AsyncMemoryTools(*_memory_tools_args(self, user_id, tz, rooms, speakers, dates, images, preset, sleep,
-                                                    today, assistant, seen, usage, own_words, diversity))
+                                                    today, assistant, seen, usage, own_words, diversity, recent_turns))

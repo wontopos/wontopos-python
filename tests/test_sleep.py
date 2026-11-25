@@ -68,7 +68,7 @@ def night_summary(res):
 
 
 REFERENCE_CALLS = 27
-REFERENCE_CALLS_DIGEST = "66cc5bf1dbde699a22947dc8e1b55991ec0fd5f410bcf6bcc27f3f171144cf4a"
+REFERENCE_CALLS_DIGEST = "1fdfdb7d867b28e3e95a1d8fe57a35e3c07a5078d71f2dff63a96e9805dce82f"
 REFERENCE_NIGHTS_DIGEST = "bbedfa7a042245922190822e61443b41086ee03466b8f61da790cae7bb0184b7"
 REFERENCE_STATE_DIGEST = "e3ebd0a08e7d1eae4e93b0a26bc7cdfec5c2cd5677d46e634ad367351117033b"
 
@@ -214,7 +214,10 @@ def scripted(system, user, first):
         heading, text = _section_of(user)
         return {"text": text + " and more"} if heading == "Big list" else {"text": "\n".join(text.split("\n")[:3])}
     if "there is no room" in system:
-        return {"text": "## Big list\n- Trimmed to what matters."}
+        held = re.findall(r"^## (.+)$", user, re.M)
+        if "Big list" in held:
+            return {"text": "## Big list\n- Trimmed to what matters."}
+        return {"text": "\n\n".join(f"## {h}\n- Trimmed." for h in held)}
     raise AssertionError("a call the script does not know: " + system[:80])
 
 
@@ -469,7 +472,7 @@ PROMPT_DIGESTS = {
     "_SLEEP_SETTLE": "c20ba6effc265bd5612530f0f657e660a30eff85f28fd846b79ba5bed20163ca",
     "_SLEEP_FOLD_SECTION": "294ec09cd08d75e1778d567c7a3b1eb2dd4dd221f662334f51d8449260fe3881",
     "_SLEEP_TIDY": "dff0600c9f98c1cc5928f75dd0101e5928e31f06a0d6aadc1a2f553706e3c16c",
-    "_SLEEP_ROOM": "41aff5a9ccb596e41031bd269a78dc4bc71aa5a9a47ec08f67ac8361c4926168",
+    "_SLEEP_ROOM": "14373fe41ff1d594a8b90b6be022a567d1a9233844f213351270fb4ce6243186",
     "_SLEEP_READER_NOTE": "0fa78c4e82cdb880ad70871895a61d7dcdc6505d5b1d1a0498c6c3c75669f028",
 }
 OPEN_BOX_DIGEST = "4fa83367c475682278e48a00a6b24fdd86a35240c36965001512e4219c1d64d8"
@@ -670,7 +673,7 @@ class SleepCases:
         self.assertEqual(res["done"]["changed"], True)
         self.assertEqual((res["sleep_id"], res["memories"], res["today"]), ("s-1", 20, "2026-09-15 23:00"))
         self.assertEqual(res["llm_in"], sum(x["in"] for x in res["log"] if "in" in x))
-        self.assertEqual((res["sleep_version"], wontopos.SLEEP_VERSION, wontopos.sleep.SLEEP_VERSION), ("1.0.2",) * 3)
+        self.assertEqual((res["sleep_version"], wontopos.SLEEP_VERSION, wontopos.sleep.SLEEP_VERSION), ("1.0.3",) * 3)
         self.assertGreater(res["llm_out"], 0)
 
     async def test_pages_are_read_to_the_end_and_today_comes_from_the_reading(self):
@@ -736,11 +739,11 @@ class SleepCases:
         self.assertEqual(paths(svc).count("self/write"), 3)
         writes = [x["body"]["writes"] for x in svc.seen if x["path"].endswith("/self/write")]
         self.assertEqual([[w["slot"] for w in ws] for ws in writes], [[0, 1], [0, 1], [0]])
-        self.assertEqual(writes[1][1]["body"], "## Big list\n- Trimmed to what matters.\n")
+        self.assertEqual(writes[1][1]["body"], "## Garden project\n- Trimmed.\n")
         room = [s for s, u in model.texts if "there is no room" in s]
         self.assertEqual(len(room), 1)
         self.assertIn("left its box \"\" at 13 tokens, over its cap\nof 11: there is no room", room[0])
-        self.assertEqual(res["rooms"], [{"file": 1, "before": 13, "after": 9}])
+        self.assertEqual(res["rooms"], [{"file": 1, "before": 13, "after": 7}])
         self.assertEqual(res["refused"][-1], {"edit": {"file": 1, "op": "room"},
                                               "why": "no room: the service counts it over its cap; the file stays as it was"})
         self.assertEqual(res["written"], {0: 1})
@@ -755,9 +758,9 @@ class SleepCases:
         res = await self.sleep(mem, model, today="2026-09-15 23:00")
         room = [s for s, u in model.texts if "there is no room" in s]
         self.assertIn("at 13 tokens, over its cap\nof 10: there is no room", room[0])
-        self.assertEqual(res["rooms"], [{"file": 1, "before": 13, "after": 9}])
+        self.assertEqual(res["rooms"], [{"file": 1, "before": 13, "after": 7}])
         self.assertEqual(res["written"], {0: 1, 1: 1})
-        self.assertEqual(svc.latest(1)["body"], "## Big list\n- Trimmed to what matters.\n")
+        self.assertEqual(svc.latest(1)["body"], "## Garden project\n- Trimmed.\n")
 
     async def test_a_no_room_answer_that_counts_0_tokens_makes_room_against_the_clients_own_cap(self):
         svc, mem = self.new()
@@ -768,7 +771,7 @@ class SleepCases:
         res = await self.sleep(mem, model, today="2026-09-15 23:00")
         room = [s for s, u in model.texts if "there is no room" in s]
         self.assertIn("at 13 tokens, over its cap\nof 11: there is no room", room[0])
-        self.assertEqual(res["rooms"], [{"file": 1, "before": 13, "after": 9}])
+        self.assertEqual(res["rooms"], [{"file": 1, "before": 13, "after": 7}])
         self.assertEqual(res["written"], {0: 1, 1: 1})
 
     async def test_another_refusal_ends_the_sleep_and_is_not_made_room_for(self):
@@ -1052,7 +1055,7 @@ class SleepCases:
         tokens = sum(r["tokens"] + 12 for r in rows)
         frame = tok(wontopos.sleep._SLEEP_DIGEST) + tok("") + tok("1: (empty)\n2: (empty)\n3: (empty)\n4: (empty)")
         sent, written = -(-(tokens + frame) * 172 // 100), -(-tokens * 7 // 100)
-        basis = {"sleep_version": "1.0.2", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": False,
+        basis = {"sleep_version": "1.0.3", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": False,
                  "margin": 0.15}
         self.assertEqual(est, {"sleep_id": "s-1", "memories": 20, "tokens": tokens, "parts": 1, "readers": 1,
                                "input_tokens": sent, "output_tokens": written,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from . import (
@@ -16,10 +17,22 @@ def _forget_image_body(client: Any, user_id: Optional[str], memory_id: Any, prev
     return body
 
 
+_MEDIA_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}")
+
+
+def _media_type(value: Any) -> str:
+    out = "application/octet-stream"
+    for given in (value.split(",") if isinstance(value, str) else ()):
+        named = given.split(";", 1)[0].strip(" \t")
+        if _MEDIA_TYPE.fullmatch(named):
+            out = named.lower()
+    return out
+
+
 def _image_bytes(status: int, headers: Any, data: bytes) -> tuple[bytes, str]:
     if not data:
         raise WosError(status, "empty image body — the service returned no bytes")
-    return data, headers.get("content-type", "application/octet-stream")
+    return data, _media_type(headers.get("content-type"))
 
 
 class _ImageCalls:

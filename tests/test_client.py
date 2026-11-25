@@ -2723,6 +2723,38 @@ class ErrorFieldsTest(SyncMake, AsyncMake, unittest.IsolatedAsyncioTestCase):
         self.assertIn("list_models()", cm.exception.message)
         self.assertEqual(len(srv.seen), 1)
 
+    # 2.2.54: the service's messages name HTTP paths; the client adds the call that does it here.
+    NO_ZONE = envelope("invalid_request_error", 'this store has no time zone. Set it once: POST /api/v1/memory/settings '
+                       '{"time_zone":"Asia/Seoul"} with this store\'s user_id. Nothing was stored.', "req_tz",
+                       code="time_zone_required")
+    NO_SPEAKER = envelope("invalid_request_error", "from Scroll 2 a speaker is required. Give metadata.speaker.", "req_sp",
+                          code="speaker_required")
+    NO_STORE = envelope("not_found_error", "Store 'alice' does not exist in this API key's workspace. Otherwise create it "
+                        'here: POST /api/v1/memory/collection {"user_id":"alice"}.', "req_st", store="alice")
+    NO_MEMORY = envelope("not_found_error", "Memory not found in this store.", "req_m")
+
+    def test_a_setup_refusal_names_the_call_that_fixes_it_here(self):
+        srv, mem = self.make([(400, {}, self.NO_ZONE), (400, {}, self.NO_SPEAKER), (404, {}, self.NO_STORE),
+                              (404, {}, self.NO_MEMORY)])
+        with self.assertRaises(wontopos.BadRequestError) as cm:
+            mem.add("x", "alice")
+        self.assertTrue(cm.exception.message.endswith(
+            'Nothing was stored. In this client: set_settings(user_id, time_zone="Asia/Seoul").'), cm.exception.message)
+        self.assertEqual(cm.exception.code, "time_zone_required")
+        with self.assertRaises(wontopos.BadRequestError) as cm:
+            mem.add("x", "alice")
+        self.assertTrue(cm.exception.message.endswith(
+            'Give metadata.speaker. In this client: register each name with add_speaker, then '
+            'set_settings(user_id, default_speakers={"user": ..., "assistant": ...}).'),
+            cm.exception.message)
+        with self.assertRaises(wontopos.NotFoundError) as cm:
+            mem.search("q", "alice")
+        self.assertTrue(cm.exception.message.endswith('In this client: create_store("alice").'), cm.exception.message)
+        # A 404 that is not about making a store says nothing of create_store.
+        with self.assertRaises(wontopos.NotFoundError) as cm:
+            mem.get("alice", "m1")
+        self.assertEqual(cm.exception.message, "Memory not found in this store.")
+
     EXPIRED = envelope("gone_error", "This sleep ran out: read it again.", "req_exp", code="sleep_expired")
     SELF_CONFLICT = envelope("conflict_error", "the file changed since it was read", "req_409",
                              code="self_version_conflict")

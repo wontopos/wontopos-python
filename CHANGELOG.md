@@ -6,6 +6,168 @@ One entry per release, covering all three SDKs (Python · TypeScript · Rust).
 same surface, same day. Patch releases are additive (new options, hardening,
 docs); nothing is removed or reordered within a minor line.
 
+## 2.2.54 — 2026-11-26
+
+**A refusal that asks you to set a store up names the call that does it, the READMEs show a Scroll 2 store's first write, and a round of hardening.**
+
+- The service's messages are written for every caller, so they name HTTP paths. When it
+  refuses a call because the store does not exist, because a Scroll 2 store has no time
+  zone, or because a write names no speaker, the clients now add the call that does it
+  here: `create_store("alice")`, `set_settings(user_id, time_zone="Asia/Seoul")`
+  (`createStore` and `setSettings` in TypeScript, and `set_settings` with a `SettingsOpts` in
+  Rust), or how to set the store's default speakers. The error's
+  class, status and `code` are as before.
+- `add_bulk`'s refusals about `segments`, and `set_settings`'s refusal of a blank default
+  speaker, use the same words in all three clients, apart from each language's own names for
+  the call, a key, a dict and no value. Rust's refusal of content given beside segments also
+  says how to send segments there: pass `None` as content.
+- The three clients' READMEs gain "Starting a store on Scroll 2": the time zone and the speakers
+  a Scroll 2 store needs before its first write, which the README above them now says it
+  needs. `settings` and `set_settings` are in their tables of methods, and a short note says
+  how to keep a call fast where its time shows, as in voice.
+- In Python's `Client`, a chunked answer can no longer make the client buffer without limit: a
+  chunk-size line or a trailer line longer than 65,536 bytes, or a chunk size below zero, is
+  refused without being buffered: as a network error, after the call is sent again where that
+  is safe, or under an error status as that status's error with its body unread. urllib3 before 2.8.0 buffers such a line whole before
+  the client can count it against its 64 MiB limit (CVE-2026-97689), and a fixed urllib3
+  needs Python 3.10, so a server could make one call hold several hundred megabytes.
+  `AsyncClient`, TypeScript and Rust do not read through urllib3.
+- The sleep reads a heading by its name however many `#` it is written with, so `## # Me` is
+  `Me`. A merge that rewrote a section it wrote as `## # Me`, or moved one so written into the
+  core from a box, replaced `## Me` with no ripe proposal, and the same spelling replaced a person's
+  section whole without the one-line check.
+- A sleep ends when the service keeps refusing its write with `self_no_room`. A box the
+  service refused twice is put back as it was stored, and is not gone over again that night for
+  sections the core also holds. The eleventh refusal in one sleep is raised as the
+  service sent it (`BadRequestError`; `ErrorKind::BadRequest` in Rust), and none of that
+  night's edits or notes is written; a core the sleep seeded from `prompt` at its start stays. Where the core and a box held a
+  section of the same name, or two boxes had each moved a new section to the other, the write
+  was sent again without end.
+- After the merge a sleep puts at most 100 questions to the model to settle a person's
+  rewrite, to tidy a section and to fold one (a question is put a second time when its answer
+  is not JSON); the questions that make room are apart from these. One merge answer that wrote hundreds of sections, or rewrote one person
+  hundreds of times, made the sleep ask once for each. A rewrite it could not settle is not
+  made, and `refused` has it; the sections it did not ask about stay as they are, and `refused`
+  says how many of those questions were left.
+- A room's answer writes no section of the core named `Me`: each comes back as the core held
+  it, and one the answer leaves out is put back. Of a heading the answer writes more times than
+  the core holds sections for, the ones too many are not used. An answer that wrote `## Me`
+  twice left the second beside the self, or kept an injected one when the being's own text
+  came second.
+- A merge does not move a section back into the core in the sleep that moved it out; a box the
+  sleep puts back as stored still gives it back to the core, as it left. Moved to a box,
+  rewritten there and moved back, a person's section was replaced whole in one night, past the
+  one line a night may overturn.
+- A room's `moved` names a section as an edit does: `## Alex` is `Alex`. Written with its `##`,
+  as the prompt's `<heading>` invites, the name matched nothing, and the person was left out of
+  the core and moved to no box. A `moved` names one section: when two sections of the core
+  have the name neither is moved, one that names none moves none, and a section whose name a
+  box cannot keep (a bare `#`) stays in the core.
+- A room's answer keeps every section, other than `Me`, that was stored before tonight with
+  text under its heading. An answer that leaves one out is not used: the file stays as it was stored, and
+  `refused` names the section (`the room made left out "Alex"`) when the answer would otherwise
+  have fitted. A section is kept when the answer has text under its heading
+  or, for the core, moves it to a box; a heading with nothing under it is a section left out,
+  and of two sections of one heading each has to be written: an answer with fewer of a heading
+  than the file has under it does not say which it kept, and is not used when one of them was
+  stored. A section the merge wrote tonight may be left out, as before, unless a file stores a
+  section of that name with text under it. A person the answer both writes and lists under
+  `moved` is moved, with the lines the core held, written as a move writes them (each a `- `
+  line); the line the answer left in the core was kept in its place. An answer that left a
+  stored section out was used, and the section was in no file afterwards.
+- The model is shown a heading with the sleep's own tags guarded, and a room reads its answer
+  that way: a section answers to its own name when the answer has that heading, else to the
+  heading it was shown under; the answer's sections of one heading stand, in order, for the
+  file's sections that answer to it, and each keeps the name the file has for it. What the
+  answer lists under `moved` is settled first, and is not one of them. A box's room that
+  writes a heading more times than the box holds sections for puts the words under the ones
+  too many in one section: the box's last section of that name when it has one, else a new
+  one. The room's prompt now says that every section stays under its own heading, with at least one
+  line, unless the core moves a person to a box, and that an answer that leaves a section out
+  is not used. It did not say so, and "leave out what a search gives back" could be read as
+  leave to drop a section.
+- A section that leaves a file holding its name twice, moved or given up as the core's double,
+  goes whole, with what was under both headings. What was under the second was in no file
+  afterwards.
+- A part of four memories or more whose first answer is not JSON and stops at its length
+  (`max_tokens`) is read in two halves instead of being asked for again, each half of two
+  memories or more, and a half is halved once more the same way: four pieces at most. A piece
+  is tried once: an answer that is not JSON is asked for one more time, and one that is cut
+  and cannot be halved leaves the piece unread. Such an answer was asked for five more times,
+  and a part whose answer could not fit held the sleep open night after night, read again
+  each time with everything after it. A part of fewer than four memories is asked as before.
+  A part with a piece still unread leaves the sleep not done, as before, and the log names
+  the pieces (`read 2a`, `read 2b`).
+- The sleep is 1.0.3.
+- On scroll-2 the recent conversation a model is brought is 50 lines unless the caller says, and
+  the caller says 0 to 100. `recall` refuses a `short_term_limit` (`shortTermLimit`) above 100 before
+  anything is sent, on every model, where it took up to 500; on a model that keeps a
+  short-term window (scroll-2) it asks for 50 lines when none is given, where the service
+  chose. Rust's `recall_with`, which sent the field as it was given, refuses one that is not a
+  whole number from 0 to 100 and sends no `null`. `memory_recent` shows the newest 50 lines of
+  the window, where it showed all of it, and `recent_turns` on `memory_tools` (`recentTurns`,
+  `with_recent_turns` in Rust) sets how many; with 0 it shows none and does not read the
+  window. `history` returns the whole window, as before, and `short_term_budget_tokens` (0 to
+  8000) is as it was.
+- The router's limit for a day does not start again when the clock reads an earlier date. An
+  app that takes each person's UTC offset for `with_tz` (`withTz`) let a person reset the
+  count by setting it back. A later date starts a new day, as before.
+- The router is shown at most the newest 100 earlier exchanges the service returns, fewer when
+  those do not fit its prompt, and in TypeScript
+  an ask's time is read from the clock as well as from its timer. A list of thousands of
+  exchanges kept the trimming loop running; in TypeScript, with a caller that has no
+  `countTokens`, it ran past the ask's time and held the event loop.
+- `memory_timeline` writes the time on every line that has one. A memory in the same minute
+  as the one above it had six blanks in place of the time, and a memory's own text could
+  write that line itself, with a line break and two blanks. Every line the tools write now
+  starts at the margin; a memory's own lines stay indented.
+- In TypeScript, `runSkill` with a signal that is already aborted, its own or the client's
+  from `withSignal`, answers `cancelled` and does not start the function. It answered
+  `cancelled` and ran it, and a function that threw on the aborted signal left an unhandled
+  rejection. A caller's `countTokens` is not started either.
+- In Rust, a code skill's function is not called once the ask's time is up. It was called, and
+  one that finished at once was answered as done after the time had run out.
+- In Python and TypeScript, the headers that carry a model key are no local variable of the code
+  that raises when a model call fails. They were one, where an error tracker that records
+  frame locals stores the whole key.
+- A number given as text is read in one pass: a memory tool's `n`, `from`, `to` and `center`
+  in Python, and a provider's `retry-after-ms` header in Python and TypeScript. A run of
+  thousands of digits with another character after it took time that grew with the square of
+  its length: 64,000 digits in the header held a Python process for about a minute. In
+  TypeScript the blanks around a rate-limit header and `X-WOS-Week-Used` are trimmed in one
+  pass as well.
+- A tool call whose `input` nests 128 or more levels deep answers `Refused: the arguments are
+  not JSON.` in all three clients, as the same arguments given as JSON text did: the memory
+  tools, and the router's `ask` tool in its own JSON. Given as an object it was used as it was,
+  and in Python a list nested some hundreds of levels deep in an argument a memory tool reads
+  raised `RecursionError`.
+- An answer of the service that holds `NaN`, `Infinity` or `-Infinity`, or a number past the
+  range of a double (`1e999`, or an integer of 400 digits), is refused as invalid JSON
+  (`WosError`) in all three clients. Python returned all of them, and TypeScript returned a
+  number past the range as `Infinity`; Rust refused them already, as serde_json does unless a
+  build turns on its `arbitrary_precision`. Python's refusal shows at most 512 characters of
+  the number. An error's body is read as each client read it before.
+- In Python, a sleep whose model cites a line or a row by a number of more than 4,300 digits
+  does not end with a `ValueError`, as it did. In
+  Rust, a heading or a title is checked for a date in one pass; a long run of digits took
+  time that grew with its square.
+- In TypeScript, a login in `baseUrl` does not survive an object spread of the client
+  (`{ ...client }`), as the API key does not.
+- `add` refuses a `metadata.speaker` that is not text (a list, a number, a boolean) with the
+  words the other writes use: `speaker must be a speaker's name (a non-blank string), got 5.`
+  All three sent it.
+- `get_image` (`getImage`) gives the picture's type as one bare `type/subtype` in lower case,
+  without parameters, and `application/octet-stream` when the header holds nothing that reads
+  as one. It gave the header as the service sent it, and the Python and TypeScript READMEs
+  build a file name from it. The photo tool says `unknown` for a picture whose type was not named.
+  In Rust a header that held a byte outside ASCII, as a file name in a parameter can, gave no
+  type; its type is read now.
+- The text of an error from the service or a provider loses the C1 control characters (U+0080
+  to U+009F) and the line and paragraph separators (U+2028, U+2029), as it loses the C0 ones.
+- On Python 3.10 and later the package requires `urllib3>=2.8.0`, which fixes the advisories
+  open against earlier releases. It does not install on Python 3.9, where the floor stays
+  `>=1.26.20` and the client bounds what it reads itself.
+
 ## 2.2.53 — 2026-11-18
 
 **More of the three SDKs' refusals say the same thing in the same words, and a metadata that is not a dict is refused.**

@@ -162,7 +162,8 @@ class PackagingTest(unittest.TestCase):
         with open(os.path.join(self.ROOT, "pyproject.toml"), encoding="utf-8") as f:
             text = f.read()
         deps = text[text.index("\ndependencies = ["):].split("]", 1)[0]
-        self.assertIn('"urllib3>=1.26.20,<3"', deps)
+        self.assertIn('"urllib3>=1.26.20,<3; python_version < \'3.10\'"', deps)
+        self.assertIn('"urllib3>=2.8.0,<3; python_version >= \'3.10\'"', deps)
 
     def test_the_source_archive_leaves_the_tests_out(self):
         with open(os.path.join(self.ROOT, "MANIFEST.in"), encoding="utf-8") as f:

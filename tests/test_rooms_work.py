@@ -253,6 +253,56 @@ class RoomsWorkCases:
                          [None, "2026-10-20T09:00:05Z", "2026-10-20T09:01:00Z", "2026-10-20T09:01:04Z"])
         self.assertEqual({b["user_id"] for b in bodies(srv)}, {"u"})
 
+    async def test_recall_asks_for_50_lines_of_the_recent_conversation_where_the_model_keeps_a_window(self):
+        srv, mem = self.new(model="scroll-2")
+        await done(mem.recall("q", "u"))
+        await done(mem.recall("q", "u", short_term_limit=0))
+        await done(mem.recall("q", "u", short_term_limit=100))
+        await done(mem.recall("q", "u", model="tablet-2"))
+        await done(mem.recall("q", "u", model=""))   # no model given: the call goes out on the client's
+        self.assertEqual([b.get("short_term_limit") for b in bodies(srv)], [50, 0, 100, None, 50])
+        srv, plain = self.new()
+        await done(plain.recall("q", "u"))
+        await done(plain.recall("q", "u", model="scroll-2"))
+        await done(plain.recall("q", "u", model="scroll-2", short_term_limit=7))
+        self.assertEqual([b.get("short_term_limit") for b in bodies(srv)], [None, 50, 7])
+
+    async def test_memory_recent_shows_the_newest_50_lines_or_as_many_as_recent_turns_says(self):
+        turns = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"line {i}",
+                  "timestamp": f"2026-10-20T09:{i // 60:02d}:{i % 60:02d}Z"} for i in range(120)]
+        window = json.dumps({"turns": turns})
+        srv, mem = self.new([(200, {}, window)] * 4, model="scroll-2")
+
+        async def shown(**kw):
+            text = await done(mem.memory_tools("u", seen=True, **kw).run({"name": "memory_recent", "input": {}}))
+            return text.split("\n")[1:]
+
+        lines = await shown()
+        self.assertEqual((len(lines), lines[0], lines[-1]), (50, "#1 you: line 119", "#50 user: line 70"))
+        lines = await shown(recent_turns=100)
+        self.assertEqual((len(lines), lines[-1]), (100, "#100 user: line 20"))
+        self.assertEqual(await shown(recent_turns=1), ["#1 you: line 119"])
+        off = mem.memory_tools("u", seen=True, recent_turns=0)
+        self.assertEqual(await done(off.run({"name": "memory_recent", "input": {}})),
+                         "The recent conversation is not shown here.")
+        self.assertEqual(await done(off.run({"name": "memory_seen", "input": {"n": 1}})),
+                         "Refused: #1 is not a line memory_recent gave.")
+        self.assertEqual(len(srv.seen), 3, "with recent_turns=0 the window is not read")
+        few = mem.memory_tools("u", seen=True, recent_turns=3)
+        self.assertEqual(len((await done(few.run({"name": "memory_recent", "input": {}}))).split("\n")), 4)
+        self.assertEqual(await done(few.run({"name": "memory_seen", "input": {"n": 4}})),
+                         "Refused: #4 is not a line memory_recent gave.")
+        self.assertEqual(len(srv.seen), 4, "a line that was not shown is not looked up")
+        made = type(few)
+        for bad in (-1, 101, 500, 1.5, "5", True):
+            with self.subTest(recent_turns=bad):
+                with self.assertRaisesRegex(ValueError, "recent_turns must be an integer between 0 and 100"):
+                    mem.memory_tools("u", seen=True, recent_turns=bad)
+                with self.assertRaisesRegex(ValueError, "recent_turns must be an integer between 0 and 100"):
+                    made(mem, "u", None, None, seen=True, recent_turns=bad)
+        self.assertEqual(made(mem, "u", None, None, seen=True)._recent_turns, 50)
+        self.assertEqual(made(mem, "u", None, None, seen=True, recent_turns=None)._recent_turns, 50)
+
     async def test_seen_shows_no_count_where_history_gives_none_and_says_an_empty_window(self):
         srv, mem = self.new([
             (200, {}, json.dumps({"turns": [{"role": "assistant", "content": "Hello.",
@@ -568,7 +618,7 @@ class RoomsWorkCases:
         cases = (
             ("room_limit", (0, 21, True, 3.0, "5"), "room_limit must be an integer between 1 and 20"),
             ("room_expand_tokens", (-1, 20001), "room_expand_tokens must be an integer between 0 and 20000"),
-            ("short_term_limit", (-1, 501), "short_term_limit must be an integer between 0 and 500"),
+            ("short_term_limit", (-1, 101, 500), "short_term_limit must be an integer between 0 and 100"),
             ("short_term_budget_tokens", (-1, 8001),
              "short_term_budget_tokens must be an integer between 0 and 8000"),
             ("max_images", (-1, 6), "max_images must be an integer between 0 and 5"),
@@ -842,7 +892,7 @@ class RoomsWorkCases:
             await done(mem.set_settings("u", default_speakers={"user": "Dana", "owner": "Kai"}))
         for bad in ("", "  ", 5):
             with self.subTest(name=bad):
-                with self.assertRaisesRegex(ValueError, "must be a speaker's name, or None to clear it"):
+                with self.assertRaisesRegex(ValueError, r"must be a speaker's name \(a non-blank string\), or None to clear it"):
                     await done(mem.set_settings("u", default_speakers={"user": bad}))
         with self.assertRaisesRegex(ValueError, "time_zone is required"):
             await done(mem.set_settings("u", time_zone=" "))
@@ -1032,12 +1082,12 @@ class RoomsWorkCases:
         refusals = (
             (dict(content="x", segments=[{"content": "y"}]), "content or segments, not both"),
             (dict(), "needs content"),
-            (dict(segments=[{"content": "y"}], speaker="Dana"), "each piece names its own speaker"),
-            (dict(segments=[]), "at least one piece"),
-            (dict(segments="text"), "segments must be a list of pieces, got str"),
+            (dict(segments=[{"content": "y"}], speaker="Dana"), "each segment names its own speaker"),
+            (dict(segments=[]), "segments must be a list of at least one segment"),
+            (dict(segments="text"), "segments must be a list of at least one segment"),
             (dict(segments=["text"]), r"segments\[0\] must be a dict"),
             (dict(segments=[{"content": "y"}, {"content": "z", "origin": "x"}]),
-             r'segments\[1\] has "origin", which a piece does not take'),
+             r'segments\[1\] has "origin": a segment takes content, speaker and created_at only'),
             (dict(segments=[{"content": "y", "createdAt": "2026-05-02T09:00:00Z"}]), r'segments\[0\] has "createdAt"'),
             (dict(segments=[{"speaker": "Dana"}]), r'segments\[0\]\["content"\] is required'),
             (dict(segments=[{"content": "  "}]), r'segments\[0\]\["content"\] is required'),
@@ -1172,7 +1222,7 @@ class RoomsWorkCases:
             "09:12 [02] We agreed to keep the width at 400. (said at least 2 times, first on 2024-08-14)",
             "2024-08-21",
             "14:06 [01] The final width for the gate is 450.",
-            "      [03] Width reminders are on. (corrected later)",
+            "14:06 [03] Width reminders are on. (corrected later)",
         ]))
         self.assertNotIn("each line says who", when.note)
         self.assertIn("memory_timeline shows", when.note)
@@ -1310,10 +1360,10 @@ class RoomsWorkCases:
             "2024-08-15",
             "[04] user: Moved to Porto.",
             "09:12 [03] you: Setting the width at 400 involves…",
-            "      [02] Dana: We agreed to keep the width at 400.",
+            "09:12 [02] Dana: We agreed to keep the width at 400.",
             "2024-08-21",
             "14:06 [01] you: The final width for the gate is 450.",
-            "      [05] user: Width reminders are on. (corrected later)",
+            "14:06 [05] user: Width reminders are on. (corrected later)",
         ]))
         self.assertEqual(await done(tools.run({"name": "memory_around", "input": {"n": 1}})), "\n".join([
             "Around [01]:",

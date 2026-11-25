@@ -25,7 +25,7 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 
 - **The same in every language** — identical recall whichever language a memory was written in (Korean · Japanese · Chinese · English).
 - **We never run an LLM over your stored memories.** Sleep, when you turn it on, runs on your own model with your own key.
-- **Bounded retrieval** — `recall()` returns the recent turns, at most `limit` long-term memories (default 10, up to 20) and at most `context_limit` rows of the surrounding conversation (default 10, up to 20), however much you've stored. Your LLM bill stops growing with history.
+- **Bounded retrieval** — `recall()` returns the recent turns (on Scroll 2: 50 lines by default, and `short_term_limit` sets 0 to 100), at most `limit` long-term memories (default 10, up to 20) and at most `context_limit` rows of the surrounding conversation (default 10, up to 20), however much you've stored. Your LLM bill stops growing with history.
 
 ## Methods
 
@@ -42,7 +42,7 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 | `search_full(query, user_id, limit=10, **opts)` | The same search with each part kept apart, `images` and `verify_used` included. |
 | `search_self(query, user_id, ...)` | The assistant's own words, kept apart from what others said. |
 | `history(user_id)` | The recent conversation. |
-| `memory_tools(user_id, preset="S-2", seen=True)` | Adds `memory_recent` and `memory_seen` to the memory tools: the recent conversation, newest first, and the memories held for one of its lines as they stand now. Off by default; `memory_recent` takes each reply's count from `history`, and `memory_seen` asks `seen` once. |
+| `memory_tools(user_id, preset="S-2", seen=True)` | Adds `memory_recent` and `memory_seen` to the memory tools: the recent conversation, newest first, and the memories held for one of its lines as they stand now. Off by default; `memory_recent` takes each reply's count from `history`, and `memory_seen` asks `seen` once. `recent_turns=` sets how many lines `memory_recent` shows, 0 to 100 (default 50). |
 | `get(user_id, memory_id)` | One memory by id and its metadata. |
 | `list_memories` · `iter_memories` · `export_memories` | Every memory in a store: a page at a time, as a stream, or all at once. |
 | `lineage(user_id, memory_id)` | The edits that followed one memory. |
@@ -59,6 +59,7 @@ ctx = mem.recall("what does alice drink?", user_id="alice")
 | `remove_speaker(speaker, user_id?)` | Unregister; memories stay. On `scroll-2` and `tablet-2` they keep the name. The store's default speaker is refused (409 `speaker_is_default`). |
 | `by_speaker(speaker, user_id?)` | What one person said, newest first. |
 | **Stores** | |
+| `settings(user_id?)` · `set_settings(user_id?, time_zone=, default_speakers=)` | A store's time zone and default speakers, and setting them. A Scroll 2 store needs both before its first write. |
 | `create_store` · `list_stores` · `delete_store` | One isolated memory space per end-user, agent or topic. Where only an admin key lists stores, `list_stores` with a standard key raises `PermissionDeniedError`. |
 | `delete(user_id, memory_id)` · `delete_all(user_id)` | Delete one memory, or every memory in a store. `delete_all` also clears the store's time zone and speakers: a Scroll 2 store needs `set_settings` and its speakers again before the next write. |
 | **Account** | |
@@ -130,6 +131,24 @@ internal and is not returned, so sorting by it makes results worse. There is no
 
 A store registers up to 50 people to start (a limit we plan to raise);
 `"me"` never needs registration and never counts against it.
+
+## Starting a store on Scroll 2
+
+A Scroll 2 store keeps the real time of every memory and who said it, so it needs its
+time zone and its speakers before the first write. A write before that is refused with
+`time_zone_required` or `speaker_required`, and nothing is stored.
+
+```python
+mem = Client(api_key="wos-live-...", model="scroll-2")
+mem.create_store("alice")
+mem.add_speaker("Alice", user_id="alice")    # the person
+mem.add_speaker("Mina", user_id="alice")     # the name your assistant goes by
+mem.set_settings("alice", time_zone="Asia/Seoul",
+                 default_speakers={"user": "Alice", "assistant": "Mina"})
+
+mem.add_turn("I moved to Busan last week.", "Noted. How is the new place?", user_id="alice")
+ctx = mem.recall("where does alice live?", user_id="alice")
+```
 
 ## Async
 
@@ -212,6 +231,17 @@ hits = mem.search("...the conversation so far...", user_id="alice",
                   cache_control={"ttl": "5m"})   # or "1h"
 ```
 
+## When each call's time shows
+
+Keep one `Client` for the life of your process, and one `AsyncClient` for the life of its
+event loop, which is the loop it first ran on: a client and its copies (`with_user`,
+`with_timeout` and the rest) share its connections, and a new connection costs extra round
+trips to the service. A connection stays open only while the service, or a proxy on the way, keeps it;
+`AsyncClient` closes one left idle for 5 seconds. A `ping()` shortly before a call whose time
+shows opens the connection ahead of it. `ping()` is a metered call itself, so make it where
+the wait would show, not before every call. In a voice app, start `recall` while the speech
+is still being transcribed.
+
 ## Reliability
 
 Built in, no configuration needed:
@@ -261,7 +291,8 @@ Built in, none of it configurable off:
 - **`Client.from_env()`** reads `WONTOPOS_API_KEY` (or `WOS_API_KEY`) — keep
   keys out of source code.
 - Plain-HTTP base URLs on non-local hosts warn. Three dependencies: `requests`
-  (floor `>=2.32.4`), `urllib3` (floor `>=1.26.20`) and `tzdata`.
+  (floor `>=2.32.4`), `urllib3` (floor `>=2.8.0` from Python 3.10 on, `>=1.26.20`
+  on 3.9) and `tzdata`.
 
 ## Errors
 
@@ -319,7 +350,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Sixteen inside 2.2 were not, deliberately and each with its
+releases are additive. Seventeen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-python/blob/main/CHANGELOG.md).

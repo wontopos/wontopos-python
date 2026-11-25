@@ -33,7 +33,7 @@ import urllib3.connection as _u3_connection
 import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
-__version__ = "2.2.53"
+__version__ = "2.2.54"
 
 __all__ = [
     "Client", "AsyncClient", "WME", "MemoryTools", "AsyncMemoryTools",
@@ -246,19 +246,96 @@ _STATUS_ERRORS = {
 _GONE_HINT = "This model is retired; list_models() lists the ones you can use."
 
 
+_SETUP_HINTS = {
+    "time_zone_required": 'In this client: set_settings(user_id, time_zone="Asia/Seoul").',
+    "speaker_required": (
+        "In this client: register each name with add_speaker, then "
+        'set_settings(user_id, default_speakers={"user": ..., "assistant": ...}).'
+    ),
+}
+_STORE_MISSING_RE = re.compile(r"^Store '([A-Za-z0-9._-]{1,64})' does not exist")
+
+
+def _setup_hint(status: int, message: str, details: Any) -> str:
+    """The call here for what the service's message names as an HTTP path: its text is written for every caller."""
+    code = details.get("code") if isinstance(details, dict) else None
+    if status == 400 and isinstance(code, str) and code in _SETUP_HINTS:
+        return _SETUP_HINTS[code]
+    if status == 404 and "POST /api/v1/memory/collection" in message:
+        named = _STORE_MISSING_RE.match(message)
+        return f"In this client: create_store({_jq(named.group(1)) if named else 'user_id'})."
+    return ""
+
+
 def _make_error(status: int, message: str, request_id: Optional[str] = None, *,
                 type: Optional[str] = None, details: Optional[dict] = None) -> WosError:
     expired = status == 410 and isinstance(details, dict) and details.get("code") == "sleep_expired"
     if status == 410 and not expired:
         message = f"{message} {_GONE_HINT}"
+    hint = _setup_hint(status, message, details)
+    if hint and not message.endswith(hint):
+        message = f"{message} {hint}"
     cls: Any = (APIConnectionError if status == 0 else WosError if expired
                 else _STATUS_ERRORS.get(status, ServerError if 500 <= status < 600 else WosError))
     return cls(status, message, request_id=request_id, type=type, details=details)
 
 
+_CHUNK_LINE_MAX = 65536
+
+
+class _BoundedReader:
+    """The socket reader a chunked body is decoded through.
+
+    urllib3 before 2.8.0 reads a chunk's size, and each trailer line, with no limit on the line, and a
+    negative chunk size reads to the end of the stream. Those bytes are buffered before `_read_body` can
+    count them, so `_MAX_RESPONSE_BYTES` never sees them. A fixed urllib3 needs Python 3.10."""
+
+    __slots__ = ("_fp",)
+
+    def __init__(self, fp: Any):
+        self._fp = fp
+
+    def readline(self, limit: Any = -1) -> bytes:
+        from urllib3.exceptions import ProtocolError
+
+        if limit is None or limit < 0 or limit > _CHUNK_LINE_MAX + 1:
+            limit = _CHUNK_LINE_MAX + 1
+        line = self._fp.readline(limit)
+        if len(line) > _CHUNK_LINE_MAX:
+            raise ProtocolError(f"a line of the chunked response is longer than {_CHUNK_LINE_MAX} bytes")
+        try:
+            below_zero = int(line.split(b";", 1)[0], 16) < 0
+        except ValueError:
+            below_zero = False
+        if below_zero:
+            self.read(-1)
+        return line
+
+    def read(self, amt: Any = -1) -> bytes:
+        from urllib3.exceptions import ProtocolError
+
+        if amt is None or amt < 0:
+            raise ProtocolError("the chunked response gives a chunk size below zero")
+        return self._fp.read(amt)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fp, name)
+
+
+def _bound_chunk_lines(raw: Any) -> None:
+    inner = getattr(raw, "_fp", None)
+    fp = getattr(inner, "fp", None)
+    if getattr(raw, "chunked", False) and fp is not None and not isinstance(fp, _BoundedReader):
+        try:
+            inner.fp = _BoundedReader(fp)
+        except AttributeError:
+            pass
+
+
 def _raw_chunks(r: Any) -> Any:
     from urllib3.exceptions import DecodeError, ProtocolError, ReadTimeoutError, SSLError
 
+    _bound_chunk_lines(r.raw)
     try:
         yield from r.raw.stream(65536, decode_content=False)
     except ProtocolError as e:

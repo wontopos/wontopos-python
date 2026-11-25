@@ -137,6 +137,13 @@ _MAX_IMAGES = 5
 _VERIFY_MAX = 3
 
 
+# How many lines of the recent conversation a call brings when it is not told: `recall` on a model that keeps
+# a short-term window, and `memory_recent`. A caller sets 0 to 100.
+_RECENT_TURNS = 50
+_RECENT_TURNS_MAX = 100
+_WINDOW_MODELS = frozenset({"scroll-2"})
+
+
 def _check_int(value: Any, name: str, lo: int, hi: int) -> None:
     if not _is_int(value) or not lo <= value <= hi:
         raise ValueError(f"{name} must be an integer between {lo} and {hi}, got {_shown(value)}.")
@@ -177,7 +184,7 @@ def _recall_body(store_id: str, query: str, form: Optional[str], tz: Optional[fl
                  long_term_cutoff: Any = None, today_start: Any = None, now: Any = None,
                  short_term_limit: Any = None, short_term_budget_tokens: Any = None,
                  max_images: Any = None, filters: Any = None, speaker: Any = None,
-                 include_superseded: Any = None) -> dict:
+                 include_superseded: Any = None, model: Any = None) -> dict:
     body: dict = {"user_id": store_id, "query": query}
     if limit is not None:
         _check_count(limit)
@@ -187,12 +194,15 @@ def _recall_body(store_id: str, query: str, form: Optional[str], tz: Optional[fl
         body["context_limit"] = context_limit
     for name, v, lo, hi in (("room_limit", room_limit, 1, 20),
                             ("room_expand_tokens", room_expand_tokens, 0, 20000),
-                            ("short_term_limit", short_term_limit, 0, 500),
+                            ("short_term_limit", short_term_limit, 0, _RECENT_TURNS_MAX),
                             ("short_term_budget_tokens", short_term_budget_tokens, 0, 8000),
                             ("max_images", max_images, 0, _MAX_IMAGES)):
         if v is not None:
             _check_int(v, name, lo, hi)
             body[name] = v
+    # `model` is the one the call goes out on: the caller's when it gives one, else the client's.
+    if short_term_limit is None and isinstance(model, str) and model in _WINDOW_MODELS:
+        body["short_term_limit"] = _RECENT_TURNS
     for name, v in (("long_term", long_term), ("long_term_cutoff", long_term_cutoff),
                     ("include_superseded", include_superseded)):
         if v is not None:
@@ -518,7 +528,7 @@ def _metadata(metadata: Optional[dict], extra: dict, created_at: Any = None) -> 
         md["created_at"] = created_at
     if md.get("created_at") is not None:
         md["created_at"] = _turn_time(md["created_at"], "created_at")
-    if isinstance(md.get("speaker"), str):
+    if md.get("speaker") is not None:
         md["speaker"] = _turn_speaker(md["speaker"], "speaker")
     _warn_on_unknown_metadata(md)
     return md
@@ -588,7 +598,9 @@ def _default_speakers(value: Any) -> dict:
         if k not in _DEFAULT_SPEAKER_KEYS:
             raise ValueError(f'default_speakers takes "user" and "assistant" only, got {_jq(k)}.')
         if v is not None and (not isinstance(v, str) or not _js_trim(v)):
-            raise ValueError(f"default_speakers[{_jq(k)}] must be a speaker's name, or None to clear it, got {_jq(v)}.")
+            raise ValueError(
+                f"default_speakers[{_jq(k)}] must be a speaker's name (a non-blank string), or None to clear it, got {_jq(v)}."
+            )
         out[k] = None if v is None else _turn_speaker(v, f"default_speakers[{_jq(k)}]")
     return out
 
@@ -658,25 +670,22 @@ def _incomplete(r: Any) -> bool:
 _SEGMENT_KEYS = ("content", "speaker", "created_at")
 
 
+_SEGMENT_SHAPE = "content, and optionally speaker and created_at"
+
+
 def _segments(segments: Any) -> list:
-    if not isinstance(segments, (list, tuple)):
-        raise ValueError(f"segments must be a list of pieces, got {type(segments).__name__}.")
-    if not segments:
-        raise ValueError("segments must hold at least one piece; for one text, pass content instead.")
+    if not isinstance(segments, (list, tuple)) or not segments:
+        raise ValueError(f"segments must be a list of at least one segment ({_SEGMENT_SHAPE}).")
     out = []
     for i, s in enumerate(segments):
         if not isinstance(s, Mapping):
-            raise ValueError(
-                f'segments[{i}] must be a dict like {{"content": ..., "speaker": ..., "created_at": ...}}, '
-                f"got {type(s).__name__}."
-            )
+            raise ValueError(f"segments[{i}] must be a dict: {_SEGMENT_SHAPE}.")
         for k in s:
             if k not in _SEGMENT_KEYS:
-                raise ValueError(f"segments[{i}] has {_jq(k)}, which a piece does not take: only content, "
-                                 "speaker and created_at.")
+                raise ValueError(f"segments[{i}] has {_jq(k)}: a segment takes content, speaker and created_at only.")
         content = s.get("content")
         if not isinstance(content, str) or not _js_trim(content):
-            raise ValueError(f'segments[{i}]["content"] is required (a non-blank string).')
+            raise ValueError(f'segments[{i}]["content"] is required: the text of that segment, not blank.')
         piece: dict = {"content": content}
         if s.get("speaker") is not None:
             piece["speaker"] = _turn_speaker(s["speaker"], f'segments[{i}]["speaker"]')
@@ -692,10 +701,10 @@ def _bulk_body(store_id: str, content: Any, category: Optional[str], timestamp: 
         if content is not None:
             raise ValueError("add_bulk takes content or segments, not both.")
         if speaker is not None:
-            raise ValueError("speaker goes with content; with segments, each piece names its own speaker.")
+            raise ValueError("speaker goes with content: with segments, each segment names its own speaker.")
         body: dict = {"user_id": store_id, "segments": _segments(segments)}
     elif content is None:
-        raise ValueError("add_bulk needs content (one text) or segments (a conversation in its pieces).")
+        raise ValueError(f"add_bulk needs content, or segments: a list of segments ({_SEGMENT_SHAPE}).")
     else:
         body = {"user_id": store_id, "content": content}
         if speaker is not None:

@@ -327,6 +327,8 @@ class _RouterState:
         with self.lock:
             L = self.limits
             d = self._days.get(store)
+            if d is not None and d["day"] > day:
+                day = d["day"]
             today = d if d is not None and d["day"] == day else {"day": day, "count": 0}
             if today["count"] >= L["per_day"]:
                 return f"this store has asked {L['per_day']} times today"
@@ -1107,6 +1109,9 @@ def _channel_read_body(store: str, speaker: Optional[str]) -> dict:
     return {"user_id": store, "channel": "router", **({} if speaker is None else {"speaker": speaker})}
 
 
+_EXCHANGES_HELD = 100
+
+
 def _exchanges(r: Any) -> list:
     return [e for e in _as_records(_as_dict(r).get("exchanges"))
             if isinstance(e.get("request"), str) and isinstance(e.get("answer"), str)]
@@ -1185,7 +1190,7 @@ def _router_decide_flow(client: Any, store: str, request: str, exchanges: list, 
     if stable > _ROUTER_STABLE_MAX_TOKENS:
         return _Fail("too_large", f"the router prompt and this store's skills come to {stable} tokens, over "
                                   f"{_ROUTER_STABLE_MAX_TOKENS}")
-    held = list(exchanges)
+    held = list(exchanges)[-_EXCHANGES_HELD:]
     while True:
         turn_text = _router_turn(held, clock, time.time(), st.name, request)
         call = base._replace(user=turn_text, system_tokens=stable if counted else None)
@@ -1538,6 +1543,8 @@ class _RouterToolsBase:
                     raw = _json_loads(arguments)
                 except (ValueError, RecursionError):
                     return None, _js_json({"ok": False, "text": _ROUTER_TEXT["notJson"]})
+        elif _nests_deeper(raw, 127):
+            return None, _js_json({"ok": False, "text": _ROUTER_TEXT["notJson"]})
         args = raw if isinstance(raw, Mapping) else {}
         request = args.get("request")
         if not isinstance(request, str) or not _js_trim(request):

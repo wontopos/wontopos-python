@@ -221,6 +221,69 @@
    "typescript_says": "setSettings needs timeZone, defaultSpeakers or both."
   },
   {
+   "case": "add_bulk: content and segments",
+   "python": "mem.add_bulk('x', 'u', segments=[{'content': 'y'}])",
+   "typescript": "mem.addBulk('x', 'u', 'general', undefined, {segments: [{content: 'y'}]})",
+   "python_says": "add_bulk takes content or segments, not both.",
+   "typescript_says": "addBulk takes content or segments, not both.",
+   "rust_says": "add_bulk_opts takes content or segments, not both: pass None as content to send segments."
+  },
+  {
+   "case": "add_bulk: neither",
+   "python": "mem.add_bulk(None, 'u')",
+   "typescript": "mem.addBulk(undefined, 'u')",
+   "python_says": "add_bulk needs content, or segments: a list of segments (content, and optionally speaker and created_at).",
+   "typescript_says": "addBulk needs content, or segments: a list of segments (content, and optionally speaker and created_at).",
+   "rust_says": "add_bulk_opts needs content, or segments: a list of segments (content, and optionally speaker and created_at)."
+  },
+  {
+   "case": "add_bulk: speaker with segments",
+   "python": "mem.add_bulk(None, 'u', segments=[{'content': 'y'}], speaker='Dana')",
+   "typescript": "mem.addBulk(null, 'u', 'general', undefined, {segments: [{content: 'y'}], speaker: 'Dana'})",
+   "python_says": "speaker goes with content: with segments, each segment names its own speaker.",
+   "typescript_says": "speaker goes with content: with segments, each segment names its own speaker."
+  },
+  {
+   "case": "add_bulk: no segments",
+   "python": "mem.add_bulk(None, 'u', segments=[])",
+   "typescript": "mem.addBulk(null, 'u', 'general', undefined, {segments: []})",
+   "python_says": "segments must be a list of at least one segment (content, and optionally speaker and created_at).",
+   "typescript_says": "segments must be a list of at least one segment (content, and optionally speaker and created_at)."
+  },
+  {
+   "case": "add_bulk: segment not a dict",
+   "python": "mem.add_bulk(None, 'u', segments=['text'])",
+   "typescript": "mem.addBulk(null, 'u', 'general', undefined, {segments: ['text']})",
+   "python_says": "segments[0] must be a dict: content, and optionally speaker and created_at.",
+   "typescript_says": "segments[0] must be an object: content, and optionally speaker and created_at.",
+   "differs_by_idiom": "a dict in Python, an object in TypeScript"
+  },
+  {
+   "case": "add_bulk: segment unknown key",
+   "python": "mem.add_bulk(None, 'u', segments=[{'content': 'y', 'origin': 'x'}])",
+   "typescript": "mem.addBulk(null, 'u', 'general', undefined, {segments: [{content: 'y', origin: 'x'}]})",
+   "python_says": "segments[0] has \"origin\": a segment takes content, speaker and created_at only.",
+   "typescript_says": "segments[0] has \"origin\": a segment takes content, speaker and created_at only."
+  },
+  {
+   "case": "add_bulk: segment blank content",
+   "python": "mem.add_bulk(None, 'u', segments=[{'content': ' '}])",
+   "typescript": "mem.addBulk(null, 'u', 'general', undefined, {segments: [{content: ' '}]})",
+   "python_says": "segments[0][\"content\"] is required: the text of that segment, not blank.",
+   "typescript_says": "segments[0].content is required: the text of that segment, not blank.",
+   "differs_by_idiom": "how each language names a key",
+   "rust_says": "segments[0].content is required: the text of that segment, not blank."
+  },
+  {
+   "case": "set_settings: blank default speaker",
+   "python": "mem.set_settings('u', default_speakers={'user': ' '})",
+   "typescript": "mem.setSettings('u', {defaultSpeakers: {user: ' '}})",
+   "python_says": "default_speakers[\"user\"] must be a speaker's name (a non-blank string), or None to clear it, got \" \".",
+   "typescript_says": "defaultSpeakers.user must be a speaker's name (a non-blank string), or null to clear it, got \" \".",
+   "differs_by_idiom": "how each language names a key and says no value",
+   "rust_says": "default_speakers.user must be a speaker's name (a non-blank string), or Some(None) to clear it, got \" \"."
+  },
+  {
    "case": "open_work: empty question",
    "python": "mem.open_work('', 'u')",
    "typescript": "mem.openWork('', 'u')",

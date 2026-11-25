@@ -113,6 +113,35 @@ class HuntRouterCases:
             self.assertIn(shown_far_near_old(old), rec.calls[0].user)
 
 
+    async def test_the_router_is_shown_the_newest_hundred_earlier_exchanges_however_many_the_service_sends(self):
+        many = [{"request": f"asked {i}", "answer": f"said {i}", "at": "2026-10-01T00:00:00Z"} for i in range(5000)]
+
+        def answer(req):
+            read = req["path"] == "/api/v1/memory/channel/read"
+            return 200, {}, {"exchanges": many} if read else {"status": "ok"}
+
+        engine = _Server(answer)
+        self.addCleanup(engine.close)
+        rec = Recorder()
+        mem = self.make(router={"router_caller": rec}, base_url=engine.base)
+        await done(mem.add_skill(LOOKUP))
+        r = await done(mem.ask("q"))
+        self.assertTrue(r["ok"], r.get("detail"))
+        shown = rec.calls[0].user
+        self.assertEqual((shown.count("request: asked "), "request: asked 4900\n" in shown, "request: asked 4899\n" in shown),
+                         (100, True, False))
+
+    async def test_a_clock_that_reads_an_earlier_date_does_not_start_a_stores_day_again(self):
+        rec = Recorder()
+        mem = self.make(router={"router_caller": rec, "limits": {"per_day": 2}})
+        await done(mem.add_skill(LOOKUP))
+        asked = [await done(mem.with_tz(tz).ask("q", turn=f"t{i}", history="none"))
+                 for i, tz in enumerate((14, -12, 14, -12))]
+        self.assertEqual([r["ok"] for r in asked], [True, True, False, False])
+        self.assertEqual((asked[2]["reason"], asked[2]["detail"]), ("limit", "this store has asked 2 times today"))
+        self.assertEqual(len(rec.calls), 2)
+
+
 class SyncHuntRouterTest(HuntRouterCases, unittest.IsolatedAsyncioTestCase):
 
     def make(self, **kw):

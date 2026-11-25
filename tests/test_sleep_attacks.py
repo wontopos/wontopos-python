@@ -165,8 +165,9 @@ class SleepAttackCases:
                 if "proposals" in before:
                     svc.notes = {"proposals": json.loads(json.dumps(before["proposals"])), "mixed": []}
                 for k, f in before.get("files", {}).items():
-                    svc.slots[int(k)].append({"version": 1, "title": f.get("title", ""), "body": f["body"],
-                                              "tokens": tok(f["body"]), "evidence": [], "day": f.get("day"),
+                    body = expand(f["body"])
+                    svc.slots[int(k)].append({"version": 1, "title": f.get("title", ""), "body": body,
+                                              "tokens": tok(body), "evidence": [], "day": f.get("day"),
                                               "sleep_id": None})
                 for n, night in enumerate(scenario["nights"]):
                     svc.give(night_rows(n, night))

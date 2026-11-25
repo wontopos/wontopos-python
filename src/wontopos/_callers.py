@@ -95,7 +95,7 @@ def _host_key(host: str) -> str:
 
 _PROVIDER_REASONS = ("credit", "spend_limit", "auth", "rate_limit", "overloaded", "bad_model", "bad_request",
                      "too_large")
-_DECIMAL_TEXT = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_DECIMAL_TEXT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
 def _clean_capped(s: str, n: int) -> str:
@@ -185,6 +185,7 @@ class _ProviderCaller:
 
     def __init__(self, base_url: str):
         self.base_url = base_url
+        self._headers: dict = {}
         self._session: Optional[requests.Session] = None
         self._lock = threading.Lock()
 
@@ -208,8 +209,7 @@ class _ProviderCaller:
                 self._session = s
             return self._session
 
-    def _post(self, url: str, headers: dict, body: Any, signal: Optional[AskSignal],
-              reason_of: Any = None) -> dict:
+    def _post(self, url: str, body: Any, signal: Optional[AskSignal], reason_of: Any = None) -> dict:
         data = _model_body_bytes(body)
         left = signal.time_left() if signal is not None else 600.0
         if left <= 0:
@@ -224,7 +224,7 @@ class _ProviderCaller:
         try:
             try:
                 r = self._sync_session().post(
-                    url, data=data, headers={"content-type": "application/json", **_ACCEPT, **headers},
+                    url, data=data, headers={"content-type": "application/json", **_ACCEPT, **self._headers},
                     auth=_url_login, timeout=(min(10.0, left), left),
                     allow_redirects=False, stream=True,
                 )
@@ -249,8 +249,7 @@ class _ProviderCaller:
                 r.close()
         return _provider_answer(status, r.headers, _model_text(raw), reason_of)
 
-    async def _apost(self, url: str, headers: dict, body: Any, signal: Optional[AskSignal],
-                     reason_of: Any = None) -> dict:
+    async def _apost(self, url: str, body: Any, signal: Optional[AskSignal], reason_of: Any = None) -> dict:
         import httpx
 
         data = _model_body_bytes(body)
@@ -263,7 +262,7 @@ class _ProviderCaller:
             async with httpx.AsyncClient(verify=_async_tls_context(), follow_redirects=False,
                                          timeout=timeout) as http:
                 async with http.stream("POST", url, content=data,
-                                       headers={"content-type": "application/json", **_ACCEPT, **headers}) as r:
+                                       headers={"content-type": "application/json", **_ACCEPT, **self._headers}) as r:
                     status = r.status_code
                     _provider_head(status, r.headers)
                     big = _too_large(status)
@@ -309,7 +308,7 @@ class _AnthropicCaller(_ProviderCaller):
 
     def _messages_args(self, c: ModelCall, count: bool) -> tuple:
         path = "/v1/messages/count_tokens" if count else "/v1/messages"
-        return f"{self.base_url}{path}", self._headers, _anthropic_body(c, count, self._ttl), c.signal
+        return f"{self.base_url}{path}", _anthropic_body(c, count, self._ttl), c.signal
 
     def call(self, c: ModelCall) -> dict:
         return _anthropic_reply(self._post(*self._messages_args(c, False)))
@@ -375,7 +374,7 @@ class _OpenAICaller(_ProviderCaller):
 
     def _args(self, c: ModelCall, fmt: str) -> tuple:
         body = _openai_body(c, fmt, self._max_field, self._effort)
-        return f"{self.base_url}/chat/completions", self._headers, body, c.signal, _openai_reason
+        return f"{self.base_url}/chat/completions", body, c.signal, _openai_reason
 
     def call(self, c: ModelCall) -> dict:
         while True:

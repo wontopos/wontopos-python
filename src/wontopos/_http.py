@@ -25,7 +25,8 @@ import urllib3.connectionpool as _u3_pool
 from urllib3.util.response import is_fp_closed as _u3_is_fp_closed
 
 from . import (
-    APIConnectionError, NotFoundError, RateLimitError, WosError, _JS_SPACE, _jq, _js_trim, _logger, _make_error, _time,
+    APIConnectionError, NotFoundError, RateLimitError, WosError, _JS_SPACE, _finite_float, _jq, _js_trim, _logger,
+    _make_error, _no_constant, _time,
 )
 from ._checks import _ENV_KEYS, _HEADER_CTL_RE, _NO_BODY_STATUS, _check_model, _idem_headers, _json_default, _warn_lock
 
@@ -491,8 +492,20 @@ _MAX_ERR_MSG = 4096
 _MAX_ERR_FIELD = 256
 
 
+_TEXT_CTL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
 def _strip_ctl(text: str) -> str:
-    return _HEADER_CTL_RE.sub("", text)
+    return _TEXT_CTL_RE.sub("", text)
+
+
+def _finite_int(s: str) -> int:
+    _finite_float(s)
+    return int(s)
+
+
+def _strict_json(text: str) -> Any:
+    return json.loads(text, parse_constant=_no_constant, parse_float=_finite_float, parse_int=_finite_int)
 
 
 def _parse_ok(status: int, text: str) -> dict:
@@ -501,9 +514,9 @@ def _parse_ok(status: int, text: str) -> dict:
             return {}
         raise WosError(status, "empty response body — expected a JSON object")
     try:
-        data = json.loads(text)
+        data = _strict_json(text)
     except (ValueError, RecursionError) as e:
-        raise WosError(status, f"invalid JSON in response: {e}") from None
+        raise WosError(status, f"invalid JSON in response: {_clean_text(str(e), 512)}") from None
     if not isinstance(data, dict):
         raise WosError(status, f"expected a JSON object in the response, got {type(data).__name__}")
     return data

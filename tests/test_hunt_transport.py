@@ -1,8 +1,10 @@
+import io
 import json
 import os
 import socket
 import sys
 import threading
+import time
 import unittest
 import zlib
 
@@ -103,6 +105,62 @@ class ErrorFieldBoundTest(Make, unittest.IsolatedAsyncioTestCase):
         self.check(cm.exception, fb.exception)
 
 
+class ErrorTextControlsTest(Make, unittest.IsolatedAsyncioTestCase):
+
+    BODY = json.dumps({"error": {"type": "ty\u0085pe", "message": "a\u0085b\u009bc\u2028d\u2029e\x1bf",
+                                 "request_id": "r\u009d1"}})
+
+    def check(self, e):
+        self.assertEqual((e.status, e.message, e.type, e.request_id), (400, "abcdef", "type", "r1"))
+
+    def test_an_errors_text_loses_the_c1_controls_and_the_unicode_line_separators_too(self):
+        _, mem = self.make([(400, {}, self.BODY)], retries=0)
+        with self.assertRaises(WosError) as cm:
+            mem.stats("alice")
+        self.check(cm.exception)
+
+    @needs_httpx
+    async def test_async_an_errors_text_loses_the_c1_controls_and_the_unicode_line_separators_too(self):
+        _, mem = self.amake([(400, {}, self.BODY)], retries=0)
+        async with mem:
+            with self.assertRaises(WosError) as cm:
+                await mem.stats("alice")
+        self.check(cm.exception)
+
+
+class ImageTypeTest(unittest.TestCase):
+
+    CASES = (("image/png", "image/png"),
+             ("IMAGE/JPEG; charset=binary", "image/jpeg"),
+             (" image/svg+xml\t", "image/svg+xml"),
+             ("text/html; charset=utf-8", "text/html"),
+             ("image/x\\..\\..\\Users\\Public\\run.bat", "application/octet-stream"),
+             ("image/../../etc", "application/octet-stream"),
+             ("image/", "application/octet-stream"),
+             ("/png", "application/octet-stream"),
+             ("image/.png", "application/octet-stream"),
+             ("image/p\u00f1g", "application/octet-stream"),
+             ("", "application/octet-stream"),
+             ("application/json, image/webp", "image/webp"), ("image/png, ../x", "image/png"),
+             ('text/plain; title="a,b"', "text/plain"),
+             (None, "application/octet-stream"))
+
+    def test_a_pictures_type_is_one_bare_type_and_subtype_or_octet_stream(self):
+        from wontopos import _images
+
+        for given, want in self.CASES:
+            with self.subTest(given=given):
+                self.assertEqual(_images._media_type(given), want)
+        picture = (b"HTTP/1.1 200 X\r\nContent-Type: image/x\\..\\..\\run.bat\r\nContent-Length: 3\r\n"
+                   b"Connection: close\r\n\r\nabc")
+        named = b"HTTP/1.1 200 X\r\nContent-Type: IMAGE/PNG; q=1\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"
+        _, base = raw_server(self, [picture, named])
+        mem = Client(KEY, base_url=base, retries=0)
+        self.addCleanup(mem.close)
+        got = [mem.get_image("alice", "11111111-1111-1111-1111-111111111111") for _ in range(2)]
+        self.assertEqual(got, [(b"abc", "application/octet-stream"), (b"abc", "image/png")])
+
+
 class KeyCheckOrderTest(unittest.TestCase):
 
     CASES = (
@@ -158,6 +216,106 @@ class DeflateFirstChunkTest(unittest.IsolatedAsyncioTestCase):
         _, base = raw_server(self, self.answers())
         async with AsyncClient(KEY, base_url=base, retries=0) as mem:
             self.assertEqual([(await mem.stats("alice"))["total_memories"] for _ in range(2)], [2, 3])
+
+
+def held_server(case, answer):
+    """Sends `answer` and then holds the connection open, so only the client can end the call."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    done = threading.Event()
+
+    def run():
+        try:
+            sock, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            sock.settimeout(5.0)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            sock.sendall(answer)
+            done.wait(30.0)
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    case.addCleanup(srv.close)
+    case.addCleanup(done.set)
+    return f"http://127.0.0.1:{srv.getsockname()[1]}"
+
+
+class ChunkFramingBoundTest(unittest.IsolatedAsyncioTestCase):
+
+    HEAD = (b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n")
+    FLOOD = b"A" * (1 << 20)
+    CASES = (
+        ("a size line that never ends", b""),
+        ("a size below zero", b"-1\r\n"),
+        ("a trailer line that never ends", b"0\r\nX-Trailer: "),
+    )
+    CLOSED = "(connection closed before the response completed)"
+
+    def test_chunk_framing_that_hides_bytes_from_the_size_cap_is_refused_at_once(self):
+        for name, prefix in self.CASES:
+            with self.subTest(case=name):
+                base = held_server(self, self.HEAD + prefix + self.FLOOD)
+                mem = Client(KEY, base_url=base, retries=0, timeout=3.0)
+                self.addCleanup(mem.close)
+                with self.assertRaises(wontopos.APIConnectionError) as cm:
+                    mem.stats("alice")
+                self.assertTrue(str(cm.exception).endswith(self.CLOSED), str(cm.exception))
+
+    @needs_httpx
+    async def test_async_chunk_framing_that_hides_bytes_from_the_size_cap_is_refused_at_once(self):
+        for name, prefix in self.CASES:
+            with self.subTest(case=name):
+                base = held_server(self, self.HEAD + prefix + self.FLOOD)
+                async with AsyncClient(KEY, base_url=base, retries=0, timeout=3.0) as mem:
+                    with self.assertRaises(wontopos.APIConnectionError) as cm:
+                        await mem.stats("alice")
+                self.assertTrue(str(cm.exception).endswith(self.CLOSED), str(cm.exception))
+
+    def test_a_size_below_zero_is_refused_whatever_follows_it(self):
+        for size in (b"-1", b"-5", b"-1;x=1"):
+            with self.subTest(size=size):
+                base = held_server(self, self.HEAD + size + b"\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                mem = Client(KEY, base_url=base, retries=0, timeout=3.0)
+                self.addCleanup(mem.close)
+                with self.assertRaises(wontopos.APIConnectionError) as cm:
+                    mem.stats("alice")
+                self.assertTrue(str(cm.exception).endswith(self.CLOSED), str(cm.exception))
+
+    def test_the_reader_under_a_chunked_body_refuses_a_long_line_and_a_read_to_the_end(self):
+        from urllib3.exceptions import ProtocolError
+
+        limit = wontopos._CHUNK_LINE_MAX
+        ok = wontopos._BoundedReader(io.BytesIO(b"1f;ext=1\r\n" + b"x" * 31 + b"\r\n"))
+        self.assertEqual((ok.readline(), ok.read(31), ok.readline(limit + 1)), (b"1f;ext=1\r\n", b"x" * 31, b"\r\n"))
+        self.assertEqual(wontopos._BoundedReader(io.BytesIO(b"y" * limit)).readline(), b"y" * limit)
+        for size in (None, -1, limit + 1, limit * 4):
+            with self.subTest(size=size):
+                with self.assertRaises(ProtocolError):
+                    wontopos._BoundedReader(io.BytesIO(b"y" * (limit + 1))).readline(size)
+        for amt in (None, -1):
+            with self.subTest(amt=amt):
+                with self.assertRaises(ProtocolError):
+                    wontopos._BoundedReader(io.BytesIO(b"y" * 8)).read(amt)
+
+    def test_a_chunked_answer_with_extensions_and_a_trailer_still_decodes(self):
+        body = (b"8;name=value\r\n{\"total_\r\n" b"d\r\nmemories\": 7}\r\n" b"0\r\nX-Checksum: abc\r\n\r\n")
+        _, base = raw_server(self, [self.HEAD + body])
+        mem = Client(KEY, base_url=base, retries=0)
+        self.addCleanup(mem.close)
+        self.assertEqual(mem.stats("alice")["total_memories"], 7)
 
 
 class ProxyTlsTest(unittest.TestCase):
@@ -224,6 +382,116 @@ class NonFiniteNumberTest(Make, unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await mem.search("q", "alice", filters={"min_importance": bad})
         self.assertEqual(srv.seen, [])
+
+
+class NonFiniteAnswerTest(Make, unittest.IsolatedAsyncioTestCase):
+
+    BODIES = ('{"total_memories": NaN}', '{"total_memories": Infinity}', '{"total_memories": -Infinity}',
+              '{"total_memories": 1e999}')
+    SAID = ("NaN is not JSON", "Infinity is not JSON", "-Infinity is not JSON",
+            "1e999 is past the range of a JSON number")
+
+    def test_a_number_json_cannot_carry_in_an_answer_is_refused(self):
+        _, mem = self.make([(200, {}, body) for body in self.BODIES] + [(200, {}, '{"total_memories": 2.5}')], retries=0)
+        for said in self.SAID:
+            with self.subTest(said=said):
+                with self.assertRaises(WosError) as cm:
+                    mem.stats("alice")
+                self.assertEqual(str(cm.exception), f"[200] invalid JSON in response: {said}")
+        self.assertEqual(mem.stats("alice"), {"total_memories": 2.5})
+
+    def test_an_integer_past_a_doubles_range_is_refused_and_the_refusal_stays_short(self):
+        _, mem = self.make([(200, {}, '{"total_memories": ' + "9" * n + "}") for n in (400, 5000)], retries=0)
+        with self.assertRaises(WosError) as cm:
+            mem.stats("alice")
+        self.assertEqual(str(cm.exception),
+                         "[200] invalid JSON in response: " + "9" * 400 + " is past the range of a JSON number")
+        with self.assertRaises(WosError) as cm:
+            mem.stats("alice")
+        self.assertLess(len(str(cm.exception)), 600)
+        self.assertNotIn("9" * 513, str(cm.exception))
+
+    @needs_httpx
+    async def test_async_a_number_json_cannot_carry_in_an_answer_is_refused(self):
+        _, mem = self.amake([(200, {}, body) for body in self.BODIES], retries=0)
+        async with mem:
+            for said in self.SAID:
+                with self.assertRaises(WosError) as cm:
+                    await mem.stats("alice")
+                self.assertEqual(str(cm.exception), f"[200] invalid JSON in response: {said}")
+
+
+class ProviderRetryHeaderTest(unittest.TestCase):
+
+    def test_a_providers_retry_after_ms_of_thousands_of_digits_is_read_at_once(self):
+        from wontopos import _callers
+
+        started = time.perf_counter()
+        for raw, want in (("9" * 16000 + "x", 1.0), ("1500", 1.5), ("2.5e3", 2.5), ("250.", 0.25), ("-1", 1.0)):
+            with self.subTest(raw=raw[:12]):
+                with self.assertRaises(wontopos.ModelCallError) as cm:
+                    _callers._provider_answer(429, {"retry-after-ms": raw}, "{}", lambda *_: "rate_limit")
+                self.assertEqual(cm.exception.retry_after, want)
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+
+def held_in(value, secret, depth=0):
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, (bytes, bytearray)):
+        return secret.encode() in value
+    if depth < 6 and isinstance(value, dict):
+        return any(held_in(k, secret, depth + 1) or held_in(v, secret, depth + 1) for k, v in value.items())
+    if depth < 6 and isinstance(value, (list, tuple, set, frozenset)):
+        return any(held_in(v, secret, depth + 1) for v in value)
+    return secret in repr(value)
+
+
+def frames_holding(exc, secret):
+    held, tb = [], exc.__traceback__.tb_next
+    while tb is not None:
+        held += [f"{tb.tb_frame.f_code.co_name}: {name}" for name, value in list(tb.tb_frame.f_locals.items())
+                 if held_in(value, secret)]
+        tb = tb.tb_next
+    return held
+
+
+class ModelKeyOffTheTracebackTest(unittest.IsolatedAsyncioTestCase):
+
+    MODEL_KEY = "sk-ant-api03-0123456789abcdefMODELKEY"
+    BODY = b'{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}'
+    REFUSED = (b"HTTP/1.1 401 X\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+               + str(len(BODY)).encode() + b"\r\n\r\n" + BODY)
+
+    def caller(self, kind, base):
+        if kind == "anthropic":
+            return wontopos.anthropic_caller(self.MODEL_KEY, base_url=base)
+        return wontopos.openai_caller(base_url=base, model="m", api_key=self.MODEL_KEY)
+
+    def test_a_refused_model_call_leaves_the_key_in_no_frame_of_its_traceback(self):
+        for kind in ("anthropic", "openai"):
+            with self.subTest(kind=kind):
+                seen, base = raw_server(self, [self.REFUSED])
+                try:
+                    self.caller(kind, base).call(wontopos.ModelCall("router", "m", ["be brief"], "hello", 16))
+                except wontopos.ModelCallError as e:
+                    self.assertEqual((e.status, len(seen)), (401, 1))
+                    self.assertEqual(frames_holding(e, self.MODEL_KEY), [])
+                else:
+                    self.fail("the provider's 401 was not raised")
+
+    @needs_httpx
+    async def test_async_a_refused_model_call_leaves_the_key_in_no_frame_of_its_traceback(self):
+        for kind in ("anthropic", "openai"):
+            with self.subTest(kind=kind):
+                seen, base = raw_server(self, [self.REFUSED])
+                try:
+                    await self.caller(kind, base)._acall(wontopos.ModelCall("router", "m", ["be brief"], "hello", 16))
+                except wontopos.ModelCallError as e:
+                    self.assertEqual((e.status, len(seen)), (401, 1))
+                    self.assertEqual(frames_holding(e, self.MODEL_KEY), [])
+                else:
+                    self.fail("the provider's 401 was not raised")
 
 
 class TzShownTest(unittest.TestCase):
